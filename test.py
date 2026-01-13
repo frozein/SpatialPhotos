@@ -359,7 +359,7 @@ def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
 
 	# define vertex position helper:
 	# ---------------
-	def get_position(sliceIdx, px, py):
+	def get_position(sliceIdx, px, py, checkPrev = True):
 
 		zAccum = 0
 		count = 0
@@ -378,7 +378,15 @@ def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
 		read_depth( 0, -1)
 		read_depth(-1, -1)
 
-		z = zAccum / count
+		if count > 0:
+			z = zAccum / count
+		else:
+			z = 0
+
+		if checkPrev:
+			_, _, prevZ = get_position(sliceIdx - 1, px, py, False)
+			if z < prevZ:
+				z = prevZ
 
 		frustumHeight = 2 * z * math.tan(vFOV / 2)
 		frustumWidth  = frustumHeight * aspect
@@ -422,14 +430,19 @@ def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
 		np.array(indices, dtype=np.uint32)
 	)
 
-def save_glb(atlas, positions, uvs, indices, out_path):
-	atlas_img = Image.fromarray(atlas)
-	img_bytes = io.BytesIO()
-	atlas_img.save(img_bytes, format="WEBP", quality=90)
-	atlas_img.save("atlas_asdf2.webp")
-	img_bytes = img_bytes.getvalue()
+def save_glb(atlas, positions, uvs, indices, outPath):
 
-	bin_blob = (
+	# encode image to WEBP:
+	# ---------------
+	imgBytes = io.BytesIO()
+
+	atlasImg = Image.fromarray(atlas)
+	atlasImg.save(imgBytes, format="WEBP", quality=90)
+	imgBytes = imgBytes.getvalue()
+
+	# define GLTF structure:
+	# ---------------
+	binBlob = (
 		positions.tobytes() +
 		uvs.tobytes() +
 		indices.tobytes()
@@ -437,7 +450,7 @@ def save_glb(atlas, positions, uvs, indices, out_path):
 
 	model = gltf.GLTF2(
 		asset=gltf.Asset(version="2.0"),
-		buffers=[gltf.Buffer(byteLength=len(bin_blob))],
+		buffers=[gltf.Buffer(byteLength=len(binBlob))],
 		bufferViews=[
 			gltf.BufferView(buffer=0, byteOffset=0, byteLength=positions.nbytes, target=gltf.ARRAY_BUFFER),
 			gltf.BufferView(buffer=0, byteOffset=positions.nbytes, byteLength=uvs.nbytes, target=gltf.ARRAY_BUFFER),
@@ -448,7 +461,7 @@ def save_glb(atlas, positions, uvs, indices, out_path):
 			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs)//2, type="VEC2"),
 			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices), type="SCALAR")
 		],
-		images=[gltf.Image(uri="data:image/webp;base64," + base64.b64encode(img_bytes).decode())],
+		images=[gltf.Image(uri="data:image/webp;base64," + base64.b64encode(imgBytes).decode())],
 		textures=[gltf.Texture(source=0)],
 		materials=[gltf.Material(
 			pbrMetallicRoughness=gltf.PbrMetallicRoughness(
@@ -469,12 +482,15 @@ def save_glb(atlas, positions, uvs, indices, out_path):
 		scene=0
 	)
 
-	model.set_binary_blob(bin_blob)
-	model.save_binary(out_path)
+	model.set_binary_blob(binBlob)
+	
+	# save:
+	# ---------------
+	model.save_binary(outPath)
 
 # ------------------------------------------- #
 
-def write_slices(orgImagePath, plyPath, outPath):
+def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	torch.set_default_device('cuda')
 
 	# load original image:
@@ -584,12 +600,12 @@ def write_slices(orgImagePath, plyPath, outPath):
 	# ---------------
 	print('Writing GLB... ', end='', flush=True)
 
-	save_glb(atlas, positions, uvs, indices, "slices.glb")
+	save_glb(atlas, positions, uvs, indices, outPath)
 
 	print('done')
 
 def main():
-	write_slices("test/input/t3d.png", "test/output/test.ply", "slices/")
+	mlsharp_to_spatial_photo("test/input/t3d.png", "test/output/test.ply", "slices.glb")
 
 if __name__ == "__main__":
 	main()
