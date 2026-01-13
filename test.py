@@ -15,19 +15,24 @@ from plyfile import PlyData
 
 # ------------------------------------------- #
 
-OUTFILL_AMOUNT = 0.0
+OUTFILL_AMOUNT = 0.1
 
 SLICE_MIN_QUANTILE = 0.0
-SLICE_MAX_QUANTILE = 0.9
+SLICE_MAX_QUANTILE = 0.8
 NUM_SLICES = 10
 
 BLOCK_SIZE = 128
 
-REPLACE_ALPHA_THRESHOLD = 0.1
+ALPHA_REPLACE_THRESHOLD = 0.1
 ALPHA_TEST_THRESHOLD = 0.5
+
+DEPTH_INFILL_CUTOFF = 0.1
+DEPTH_INFILL_OUTLIER_STD = 2.0
 
 ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
+
+UV_PADDING = 2.0
 
 # ------------------------------------------- #
 
@@ -86,17 +91,21 @@ def load_ply(path, device='cuda'):
 
 # ------------------------------------------- #
 
+def slice_t(numSlices, idx):
+	return (idx / numSlices) * (idx / numSlices)
+
 def get_slice(gaussians, numSlices, idx, includeBehind = False):
 	means, scales, rotations, opacities, colors = gaussians
 
 	zMin = torch.quantile(means[:, 2], SLICE_MIN_QUANTILE)
 	zMax = torch.quantile(means[:, 2], SLICE_MAX_QUANTILE)
+	zRange = zMax - zMin
 
-	sliceSize = (zMax - zMin) / numSlices
+	tMin = slice_t(numSlices, idx)
+	tMax = slice_t(numSlices, idx + 1)
 
-	zMinSlice = idx * sliceSize
-	zMaxSlice = (idx + 1) * sliceSize
-
+	zMinSlice = zMin + tMin * zRange
+	zMaxSlice = zMin + tMax * zRange
 	
 	if (idx == numSlices - 1) or includeBehind:
 		where = means[:, 2] >= zMinSlice
@@ -276,10 +285,10 @@ def generate_block_atlas(slices, blockSize):
 			ox = (bx - placementsMeta[i][1])
 			oy = (by - placementsMeta[i][2])
 
-			u0 = (ax + ox + 1.0) / atlasWidth
-			v0 = (ay + oy + 1.0) / atlasHeight
-			u1 = (ax + ox + blockSize - 1.0) / atlasWidth
-			v1 = (ay + oy + blockSize - 1.0) / atlasHeight
+			u0 = (ax + ox + UV_PADDING) / atlasWidth
+			v0 = (ay + oy + UV_PADDING) / atlasHeight
+			u1 = (ax + ox + blockSize - UV_PADDING) / atlasWidth
+			v1 = (ay + oy + blockSize - UV_PADDING) / atlasHeight
 
 			placements.append((idx, bx, by, u0, v1, u1, v0))
 
@@ -290,59 +299,9 @@ def generate_block_atlas(slices, blockSize):
 
 	return atlas, placements
 
-"""
-def generate_block_atlas_naive(slices, blockSize, alphaThreshold):
-
-	# get all blocks:
-	# ---------------
-	blocks = []
-
-	for idx, (img, depth) in enumerate(tqdm(slices, desc="Generating blocks", unit="slice")):
-		height, width, _ = img.shape
-		for y in range(0, height, blockSize):
-			for x in range(0, width, blockSize):
-				block = img[y:y+blockSize, x:x+blockSize]
-				if block.shape[0] != blockSize or block.shape[1] != blockSize:
-					continue
-				
-				alpha = block[..., 3]
-				if np.all(alpha < alphaThreshold * 255.0):
-					continue
-
-				blocks.append((idx, x, y, np.flip(block, axis=0)))
-
-	# pack atlas:
-	# ---------------
-	numCols = int(math.ceil(math.sqrt(len(blocks))))
-	numRows = int(math.ceil(len(blocks) / numCols))
-
-	atlasWidth = numCols * blockSize
-	atlasHeight = numRows * blockSize
-	atlas = np.zeros((atlasHeight, atlasWidth, 4), dtype=np.uint8)
-
-	placements = []
-
-	for i, (idx, x, y, block) in enumerate(tqdm(blocks, desc="Packing block atlas", unit="block")):
-		cx = (i % numCols) * blockSize
-		cy = (i // numCols) * blockSize
-		atlas[cy:cy+blockSize, cx:cx+blockSize] = block
-
-		u0 = cx / atlasWidth
-		v0 = cy / atlasHeight
-		u1 = (cx + blockSize) / atlasWidth
-		v1 = (cy + blockSize) / atlasHeight
-
-		placements.append((idx, x, y, u0, v0, u1, v1))
-
-	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
-	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
-
-	return atlas, placements
-"""
-
 # ------------------------------------------- #
 
-def fill_block_depth(depthBlock, outlierStd=2.0):
+def fill_block_depth(depthBlock):
 
 	# find out where depth valid:
 	# ---------------
@@ -357,7 +316,7 @@ def fill_block_depth(depthBlock, outlierStd=2.0):
 	# ---------------
 	mean = zs.mean()
 	std = zs.std()
-	inlierMask = np.abs(zs - mean) <= outlierStd * std
+	inlierMask = np.abs(zs - mean) <= DEPTH_INFILL_OUTLIER_STD * std
 	xs, ys, zs = xs[inlierMask], ys[inlierMask], zs[inlierMask]
 
 	# fit to plane:
@@ -373,12 +332,16 @@ def fill_block_depth(depthBlock, outlierStd=2.0):
 	# infill:
 	# ---------------
 	filled = depthBlock.copy()
-	filled[~valid] = zEst[~valid]
+
+	if valid.mean() < DEPTH_INFILL_CUTOFF:
+		filled[~valid] = mean
+	else:
+		filled[~valid] = zEst[~valid]
 
 	return filled
 
 
-def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
+def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 	# infill depth for each block:
 	# ---------------
@@ -422,11 +385,8 @@ def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
 			if z < prevZ:
 				z = prevZ
 
-		frustumHeight = 2 * z * math.tan(vFOV / 2)
-		frustumWidth  = frustumHeight * aspect
-
-		x = (px / width - 0.5) * frustumWidth
-		y = (0.5 - py / height) * frustumHeight
+		x = (px - width  * 0.5) * z / focal
+		y = (height * 0.5 - py) * z / focal
 
 		return x, y, z
 
@@ -471,7 +431,7 @@ def save_glb(atlas, positions, uvs, indices, outPath):
 	imgBytes = io.BytesIO()
 
 	atlasImg = Image.fromarray(atlas)
-	atlasImg.save(imgBytes, format="WEBP", quality=90)
+	atlasImg.save(imgBytes, format="WEBP")
 	imgBytes = imgBytes.getvalue()
 
 	# define GLTF structure:
@@ -532,12 +492,16 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	print('Reading original image... ', end='', flush=True)
 
 	orgImage = Image.open(orgImagePath)
-	width = orgImage.width
-	height = orgImage.height
-	aspect = width / height
+	orgWidth = orgImage.width
+	orgHeight = orgImage.height
 
-	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * width)
-	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * height)
+	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * orgWidth)
+	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * orgHeight)
+
+	outfilledWidth  = (outfilledWidth  // BLOCK_SIZE) * BLOCK_SIZE
+	outfilledHeight = (outfilledHeight // BLOCK_SIZE) * BLOCK_SIZE
+
+	aspect = outfilledWidth / outfilledHeight
 
 	print('done')
 
@@ -561,7 +525,7 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	focalX = focalY
 
 	settings = ddgs.Settings(
-		width=width, height=height,
+		width=outfilledWidth, height=outfilledHeight,
 		view=view, proj=proj,
 		focalX=focalX, focalY=focalY,
 		outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
@@ -589,9 +553,6 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 		img = np.dstack((color, alpha))
 		img = (img * 255).astype(np.uint8)
 
-		img = np.flip(img, 1)
-		depth = np.flip(depth, 1)
-
 		slices.append((img, depth))
 
 	# replace pixels where GT data exists:
@@ -599,19 +560,40 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	print('Replacing renders with GT color... ', end='', flush=True)
 
 	orgRGB = np.array(orgImage.convert("RGB"), dtype=np.uint8)
+	orgRGB = np.flip(orgRGB, 1)
 
 	alphaStack = np.stack([
 		slices[i][0][..., 3]
 		for i in range(NUM_SLICES)
 	], axis=0)
 
-	hitMask = alphaStack > (REPLACE_ALPHA_THRESHOLD * 255.0)
+	hitMask = alphaStack > (ALPHA_REPLACE_THRESHOLD * 255.0)
 	hitAny = hitMask.any(axis=0)
 	firstHit = np.argmax(hitMask, axis=0)
 
+	offX = (outfilledWidth - orgWidth) // 2
+	offY = (outfilledHeight - orgHeight) // 2
+	yy, xx = np.meshgrid(
+		np.arange(outfilledHeight),
+		np.arange(outfilledWidth),
+		indexing="ij"
+	)
+
+	insideGT = (
+		(xx >= offX) & (xx < offX + orgWidth) &
+		(yy >= offY) & (yy < offY + orgHeight)
+	)
+
 	for s in range(NUM_SLICES):
-		mask = (firstHit == s) & hitAny
-		slices[s][0][mask, :3] = orgRGB[mask]
+		mask = (firstHit == s) & hitAny & insideGT
+
+		if not mask.any():
+			continue
+
+		orgX = xx[mask] - offX
+		orgY = yy[mask] - offY
+
+		slices[s][0][mask, :3] = orgRGB[orgY, orgX]
 
 	print('done')
 
@@ -625,10 +607,10 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	positions, uvs, indices = build_geometry(
 		placements,
 		slices,
-		width,
-		height,
+		outfilledWidth,
+		outfilledHeight,
 		BLOCK_SIZE,
-		fov,
+		focalY,
 		aspect
 	)
 
@@ -641,7 +623,7 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	print('done')
 
 def main():
-	mlsharp_to_spatial_photo("test/input/t3d.png", "test/output/test.ply", "slices.glb")
+	mlsharp_to_spatial_photo("test/input/boys.png", "test/output/boys.ply", "boys.glb")
 
 if __name__ == "__main__":
 	main()
