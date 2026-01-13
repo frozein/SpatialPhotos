@@ -26,6 +26,9 @@ BLOCK_SIZE = 128
 REPLACE_ALPHA_THRESHOLD = 0.1
 ALPHA_TEST_THRESHOLD = 0.5
 
+ATLAS_MIN_SIZE = 64
+ATLAS_MAX_SIZE = 8192
+
 # ------------------------------------------- #
 
 def look_at(eye, target, up):
@@ -83,7 +86,7 @@ def load_ply(path, device='cuda'):
 
 # ------------------------------------------- #
 
-def get_slice(gaussians, numSlices, idx):
+def get_slice(gaussians, numSlices, idx, includeBehind = False):
 	means, scales, rotations, opacities, colors = gaussians
 
 	zMin = torch.quantile(means[:, 2], SLICE_MIN_QUANTILE)
@@ -95,10 +98,10 @@ def get_slice(gaussians, numSlices, idx):
 	zMaxSlice = (idx + 1) * sliceSize
 
 	
-	if idx == 0:
-		where = means[:, 2] < zMaxSlice
-	if idx == numSlices - 1:
+	if (idx == numSlices - 1) or includeBehind:
 		where = means[:, 2] >= zMinSlice
+	elif idx == 0:
+		where = means[:, 2] < zMaxSlice
 	else:
 		where = (means[:, 2] >= zMinSlice) & (means[:, 2] < zMaxSlice)
 
@@ -191,6 +194,42 @@ def build_merged_blocks(blocks, rects, blockSize):
 
 	return merged
 
+def pack_blocks(mergedBlocks):
+
+	# binary search to find best size:
+	# ---------------
+	def fits(size):
+		packer = rectpack.newPacker(rotation=False)
+		for i, (w, h, _, _) in enumerate(mergedBlocks):
+			packer.add_rect(w, h, i)
+
+		packer.add_bin(size, size)
+		packer.pack()
+
+		return len(packer.rect_list()) == len(mergedBlocks)
+
+	low, high = ATLAS_MIN_SIZE, ATLAS_MAX_SIZE
+	bestSize = high
+
+	while (high - low) > ATLAS_MIN_SIZE:
+		mid = (low + high) // 2
+		if fits(mid):
+			bestSize = mid
+			high = mid - 1
+		else:
+			low = mid + 1
+
+	# pack using best size:
+	# ---------------
+	finalPacker = rectpack.newPacker(rotation=False)
+	for i, (w, h, _, _) in enumerate(mergedBlocks):
+		finalPacker.add_rect(w, h, i)
+	
+	finalPacker.add_bin(bestSize, bestSize)
+	finalPacker.pack()
+
+	return finalPacker
+
 def generate_block_atlas(slices, blockSize):
 
 	mergedBlocks = []
@@ -206,20 +245,15 @@ def generate_block_atlas(slices, blockSize):
 		rects = greedy_mesh(mask)
 		merged = build_merged_blocks(blocks, rects, blockSize)
 
-		for (px, py, pw, ph, img_block, asdf) in merged:
-			mergedBlocks.append((pw, ph, img_block, asdf))
+		for (px, py, pw, ph, imgBlock, asdf) in merged:
+			mergedBlocks.append((pw, ph, imgBlock, asdf))
 			placementsMeta.append((idx, px, py, pw, ph))
 
 	# pack greedy meshed rects into atlas:
 	# ---------------
 	print("Packing slices into atlas... ", end='', flush=True)
 
-	packer = rectpack.newPacker(rotation=False)
-	for i, (w, h, _, _) in enumerate(mergedBlocks):
-		packer.add_rect(w, h, i)
-
-	packer.add_bin(6144, 6144) # TODO: ladder up in size, find smallest size that fits
-	packer.pack()
+	packer = pack_blocks(mergedBlocks)
 
 	bin0 = packer.bin_list()[0]
 	atlasWidth, atlasHeight = bin0
@@ -230,22 +264,22 @@ def generate_block_atlas(slices, blockSize):
 	for rect in packer.rect_list():
 		_, ax, ay, aw, ah, i = rect
 
-		_, _, img, block_coords = mergedBlocks[i]
+		_, _, img, blockCoords = mergedBlocks[i]
 		idx, _, _, _, _ = placementsMeta[i]
 
 		atlas[ay:ay+ah, ax:ax+aw] = img
 
-		for gx, gy in block_coords:
+		for gx, gy in blockCoords:
 			bx = gx * blockSize
 			by = gy * blockSize
 
 			ox = (bx - placementsMeta[i][1])
 			oy = (by - placementsMeta[i][2])
 
-			u0 = (ax + ox) / atlasWidth
-			v0 = (ay + oy) / atlasHeight
-			u1 = (ax + ox + blockSize) / atlasWidth
-			v1 = (ay + oy + blockSize) / atlasHeight
+			u0 = (ax + ox + 1.0) / atlasWidth
+			v0 = (ay + oy + 1.0) / atlasHeight
+			u1 = (ax + ox + blockSize - 1.0) / atlasWidth
+			v1 = (ay + oy + blockSize - 1.0) / atlasHeight
 
 			placements.append((idx, bx, by, u0, v1, u1, v0))
 
@@ -539,14 +573,16 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	slices = []
 	
 	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice'):
-		means, scales, rotations, opacities, colors = get_slice(gaussians, NUM_SLICES, i)
-
 		render = ddgs.render(
 			settings,
-			means, scales, rotations, opacities, colors
+			*get_slice(gaussians, NUM_SLICES, i)
+		)
+		renderBehind = ddgs.render(
+			settings,
+			*get_slice(gaussians, NUM_SLICES, i, includeBehind=True)
 		)
 	
-		color = render.color.detach().cpu().numpy()
+		color = renderBehind.color.detach().cpu().numpy()
 		alpha = render.alpha.detach().cpu().numpy()
 		depth = render.depth.detach().cpu().numpy()
 
