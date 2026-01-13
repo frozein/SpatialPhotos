@@ -1,22 +1,30 @@
-import torch
-from PIL import Image
+import os
+import io
 import math
 import ddgs
 import numpy as np
-from plyfile import PlyData
-import imageio.v2 as imageio
-import os
-from tqdm import tqdm
-import io
+import torch
 import base64
+import rectpack
 import pygltflib as gltf
+import imageio.v2 as imageio
+
+from PIL import Image
+from tqdm import tqdm
+from plyfile import PlyData
+
+# ------------------------------------------- #
+
+OUTFILL_AMOUNT = 0.0
 
 SLICE_MIN_QUANTILE = 0.0
 SLICE_MAX_QUANTILE = 0.9
-REPLACE_ALPHA_THRESHOLD = 0.1
-BLOCK_SIZE = 128
-OUTFILL_AMOUNT = 0.0
 NUM_SLICES = 10
+
+BLOCK_SIZE = 128
+
+REPLACE_ALPHA_THRESHOLD = 0.1
+ALPHA_TEST_THRESHOLD = 0.5
 
 # ------------------------------------------- #
 
@@ -50,8 +58,6 @@ def perspective(fovy, aspect, znear, zfar):
 
 	return m
 
-# ------------------------------------------- #
-
 def load_ply(path, device='cuda'):
 	data = PlyData.read(path)
 	vertex = data['vertex'].data
@@ -68,15 +74,14 @@ def load_ply(path, device='cuda'):
 
 	numGaussians = means.shape[0]
 
-	# colors[:, 0] = 1.0
-	# colors[:, 1] = 0.0
-	# colors[:, 2] = 0.0
 	colors = colors.reshape((numGaussians, 1, 3)) # reshape to match expected format
 
 	gaussians = (means, scales, rotations, opacities, colors)
 	focalY = data['intrinsic'].data['intrinsic'][0]
 
 	return gaussians, focalY
+
+# ------------------------------------------- #
 
 def get_slice(gaussians, numSlices, idx):
 	means, scales, rotations, opacities, colors = gaussians
@@ -101,171 +106,164 @@ def get_slice(gaussians, numSlices, idx):
 
 # ------------------------------------------- #
 
-import numpy as np
-import math
-from rectpack import newPacker
-from tqdm import tqdm
+def extract_blocks(img, blockSize):
+	h, w, _ = img.shape
+	gw, gh = w // blockSize, h // blockSize
 
+	present = np.zeros((gh, gw), dtype=bool)
+	blocks = {}
 
-# ------------------------------------------------------------
-# helpers
-# ------------------------------------------------------------
+	for gy in range(gh):
+		for gx in range(gw):
+			y = gy * blockSize
+			x = gx * blockSize
+			block = img[y:y+blockSize, x:x+blockSize]
 
-def extract_block_grid(img, blockSize, alphaThreshold):
-    h, w, _ = img.shape
-    gw, gh = w // blockSize, h // blockSize
+			alpha = block[..., 3]
+			if np.any(alpha >= ALPHA_TEST_THRESHOLD * 255.0):
+				present[gy, gx] = True
+				blocks[(gx, gy)] = block
 
-    present = np.zeros((gh, gw), dtype=bool)
-    blocks = {}
-
-    for gy in range(gh):
-        for gx in range(gw):
-            y = gy * blockSize
-            x = gx * blockSize
-            block = img[y:y+blockSize, x:x+blockSize]
-
-            alpha = block[..., 3]
-            if np.any(alpha >= alphaThreshold * 255.0):
-                present[gy, gx] = True
-                blocks[(gx, gy)] = np.flip(block, axis=0)
-
-    return present, blocks
-
+	return present, blocks
 
 def maximal_rectangles(mask):
-    h, w = mask.shape
-    heights = np.zeros(w, dtype=int)
-    rects = []
+	h, w = mask.shape
+	heights = np.zeros(w, dtype=int)
+	rects = []
 
-    for y in range(h):
-        for x in range(w):
-            heights[x] = heights[x] + 1 if mask[y, x] else 0
+	for y in range(h):
+		for x in range(w):
+			heights[x] = heights[x] + 1 if mask[y, x] else 0
 
-        stack = []
-        x = 0
-        while x <= w:
-            cur = heights[x] if x < w else 0
-            if not stack or cur >= heights[stack[-1]]:
-                stack.append(x)
-                x += 1
-            else:
-                top = stack.pop()
-                width = x if not stack else x - stack[-1] - 1
-                height = heights[top]
-                if width > 0 and height > 0:
-                    rects.append((x - width, y - height + 1, width, height))
-    return rects
+		stack = []
+		x = 0
+		while x <= w:
+			cur = heights[x] if x < w else 0
+			if not stack or cur >= heights[stack[-1]]:
+				stack.append(x)
+				x += 1
+			else:
+				top = stack.pop()
+				width = x if not stack else x - stack[-1] - 1
+				height = heights[top]
+				if width > 0 and height > 0:
+					rects.append((x - width, y - height + 1, width, height))
 
+	return rects
 
 def greedy_mesh(mask):
-    mask = mask.copy()
-    rects_out = []
+	mask = mask.copy()
+	rectsOut = []
 
-    while np.any(mask):
-        rects = maximal_rectangles(mask)
-        x, y, w, h = max(rects, key=lambda r: r[2] * r[3])
-        rects_out.append((x, y, w, h))
-        mask[y:y+h, x:x+w] = False
+	while np.any(mask):
+		rects = maximal_rectangles(mask)
+		x, y, w, h = max(rects, key=lambda r: r[2] * r[3])
 
-    return rects_out
+		rectsOut.append((x, y, w, h))
+		
+		mask[y:y+h, x:x+w] = False
 
+	return rectsOut
 
 def build_merged_blocks(blocks, rects, blockSize):
-    merged = []
+	merged = []
 
-    for gx, gy, gw, gh in rects:
-        px = gx * blockSize
-        py = gy * blockSize
-        pw = gw * blockSize
-        ph = gh * blockSize
+	for gx, gy, gw, gh in rects:
+		px = gx * blockSize
+		py = gy * blockSize
+		pw = gw * blockSize
+		ph = gh * blockSize
 
-        img = np.zeros((ph, pw, 4), dtype=np.uint8)
-        for dy in range(gh):
-            for dx in range(gw):
-                block = blocks[(gx + dx, gy + dy)]
-                img[
-                    dy*blockSize:(dy+1)*blockSize,
-                    dx*blockSize:(dx+1)*blockSize
-                ] = block
+		img = np.zeros((ph, pw, 4), dtype=np.uint8)
+		blockCoords = []
 
-        merged.append((px, py, pw, ph, img))
+		for dy in range(gh):
+			for dx in range(gw):
+				block = blocks[(gx + dx, gy + dy)]
+				img[
+					dy*blockSize:(dy+1)*blockSize,
+					dx*blockSize:(dx+1)*blockSize
+				] = block
 
-    return merged
+				blockCoords.append((gx + dx, gy + dy))
 
+		merged.append((px, py, pw, ph, img, blockCoords))
 
-# ------------------------------------------------------------
-# replacement function
-# ------------------------------------------------------------
+	return merged
 
-def generate_block_atlas(slices, blockSize, alphaThreshold):
+def generate_block_atlas(slices, blockSize):
 
-    merged_blocks = []
-    placement_meta = []
+	mergedBlocks = []
+	placementsMeta = []
 
-    # --------------------------------------------------------
-    # per-slice greedy meshing
-    # --------------------------------------------------------
-    for idxRev, (img, depth) in enumerate(
-        reversed(tqdm(slices, desc="Greedy meshing slices", unit="slice"))
-    ):
-        idx = len(slices) - 1 - idxRev
+	# greedy mesh each slice:
+	# ---------------
+	for idx, (img, depth) in enumerate(tqdm(slices, desc="Greedy meshing slices", unit="slice")):
+		mask, blocks = extract_blocks(img, blockSize)
+		if not np.any(mask):
+			continue
 
-        mask, blocks = extract_block_grid(img, blockSize, alphaThreshold)
-        if not np.any(mask):
-            continue
+		rects = greedy_mesh(mask)
+		merged = build_merged_blocks(blocks, rects, blockSize)
 
-        rects = greedy_mesh(mask)
-        merged = build_merged_blocks(blocks, rects, blockSize)
+		for (px, py, pw, ph, img_block, asdf) in merged:
+			mergedBlocks.append((pw, ph, img_block, asdf))
+			placementsMeta.append((idx, px, py, pw, ph))
 
-        for (px, py, pw, ph, img_block) in merged:
-            merged_blocks.append((pw, ph, img_block))
-            placement_meta.append((idx, px, py, pw, ph))
+	# pack greedy meshed rects into atlas:
+	# ---------------
+	print("Packing slices into atlas... ", end='', flush=True)
 
-    # --------------------------------------------------------
-    # atlas packing (MaxRects)
-    # --------------------------------------------------------
-    packer = newPacker(rotation=False)
+	packer = rectpack.newPacker(rotation=False)
+	for i, (w, h, _, _) in enumerate(mergedBlocks):
+		packer.add_rect(w, h, i)
 
-    for i, (w, h, _) in enumerate(merged_blocks):
-        packer.add_rect(w, h, i)
+	packer.add_bin(6144, 6144) # TODO: ladder up in size, find smallest size that fits
+	packer.pack()
 
-    # start large, grows only if needed
-    packer.add_bin(16384, 16384)
-    packer.pack()
+	bin0 = packer.bin_list()[0]
+	atlasWidth, atlasHeight = bin0
+	atlas = np.zeros((atlasHeight, atlasWidth, 4), dtype=np.uint8)
 
-    bin0 = packer.bin_list()[0]
-    atlasWidth, atlasHeight = bin0.width, bin0.height
-    atlas = np.zeros((atlasHeight, atlasWidth, 4), dtype=np.uint8)
+	placements = []
 
-    placements = []
+	for rect in packer.rect_list():
+		_, ax, ay, aw, ah, i = rect
 
-    for rect in packer.rect_list():
-        _, x, y, w, h, i = rect
-        _, _, img = merged_blocks[i]
-        atlas[y:y+h, x:x+w] = img
+		_, _, img, block_coords = mergedBlocks[i]
+		idx, _, _, _, _ = placementsMeta[i]
 
-        idx, px, py, pw, ph = placement_meta[i]
+		atlas[ay:ay+ah, ax:ax+aw] = img
 
-        u0 = x / atlasWidth
-        v0 = y / atlasHeight
-        u1 = (x + w) / atlasWidth
-        v1 = (y + h) / atlasHeight
+		for gx, gy in block_coords:
+			bx = gx * blockSize
+			by = gy * blockSize
 
-        placements.append((idx, px, py, pw, ph, u0, v0, u1, v1))
+			ox = (bx - placementsMeta[i][1])
+			oy = (by - placementsMeta[i][2])
 
-    return atlas, placements
+			u0 = (ax + ox) / atlasWidth
+			v0 = (ay + oy) / atlasHeight
+			u1 = (ax + ox + blockSize) / atlasWidth
+			v1 = (ay + oy + blockSize) / atlasHeight
 
+			placements.append((idx, bx, by, u0, v1, u1, v0))
+
+	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
+	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
+
+	print('done')
+
+	return atlas, placements
 
 """
-def generate_block_atlas(slices, blockSize, alphaThreshold):
-	"""
+def generate_block_atlas_naive(slices, blockSize, alphaThreshold):
+
 	# get all blocks:
 	# ---------------
 	blocks = []
 
-	for idxRev, (img, depth) in enumerate(reversed(tqdm(slices, desc="Generating blocks", unit="slice"))):
-		idx = len(slices) - 1 - idxRev
-
+	for idx, (img, depth) in enumerate(tqdm(slices, desc="Generating blocks", unit="slice")):
 		height, width, _ = img.shape
 		for y in range(0, height, blockSize):
 			for x in range(0, width, blockSize):
@@ -302,68 +300,107 @@ def generate_block_atlas(slices, blockSize, alphaThreshold):
 
 		placements.append((idx, x, y, u0, v0, u1, v1))
 
-	return atlas, placements
-	"""
-	mergedBlocks = build_merged_blocks()
-	return pack_atlas()
+	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
+	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
 
-def fill_block_depth(depthBlock):
-	"""
-	depthBlock: (B, B) float32, zeros = invalid
-	returns: filled depthBlock
-	"""
+	return atlas, placements
+"""
+
+# ------------------------------------------- #
+
+def fill_block_depth(depthBlock, outlierStd=2.0):
+
+	# find out where depth valid:
+	# ---------------
 	valid = depthBlock > 0
 	if not valid.any():
-		return depthBlock  # nothing to do
+		return depthBlock
 
 	ys, xs = np.where(valid)
 	zs = depthBlock[ys, xs]
 
-	# Fit plane: z = ax + by + c (least squares)
+	# remove outliers:
+	# ---------------
+	mean = zs.mean()
+	std = zs.std()
+	inlierMask = np.abs(zs - mean) <= outlierStd * std
+	xs, ys, zs = xs[inlierMask], ys[inlierMask], zs[inlierMask]
+
+	# fit to plane:
+	# ---------------
 	A = np.stack([xs, ys, np.ones_like(xs)], axis=1)
 	coeff, *_ = np.linalg.lstsq(A, zs, rcond=None)
 	a, b, c = coeff
 
 	H, W = depthBlock.shape
 	yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-	z_est = a * xx + b * yy + c
+	zEst = a * xx + b * yy + c
 
+	# infill:
+	# ---------------
 	filled = depthBlock.copy()
-	filled[~valid] = z_est[~valid]
+	filled[~valid] = zEst[~valid]
 
 	return filled
 
 
 def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
+
+	# infill depth for each block:
+	# ---------------
+	blockDepths = {}
+	for (sliceIdx, px, py, _, _, _, _) in tqdm(placements, desc="Filling block depths", unit="block"):
+		_, depth = slices[sliceIdx]
+
+		depthBlock = depth[py:py+blockSize, px:px+blockSize, 0]
+		depthBlock = fill_block_depth(depthBlock)
+
+		blockDepths[f"{sliceIdx}:{px}:{py}"] = depthBlock
+
+	# define vertex position helper:
+	# ---------------
+	def get_position(sliceIdx, px, py):
+
+		zAccum = 0
+		count = 0
+		def read_depth(gx, gy):
+			nonlocal zAccum, count
+
+			key = f"{sliceIdx}:{px + gx * blockSize}:{py + gy * blockSize}"
+			if key in blockDepths:
+				block = blockDepths[key]
+
+				zAccum += block[(blockSize + gy) % blockSize, (blockSize + gx) % blockSize]
+				count += 1
+
+		read_depth( 0,  0)
+		read_depth(-1,  0)
+		read_depth( 0, -1)
+		read_depth(-1, -1)
+
+		z = zAccum / count
+
+		frustumHeight = 2 * z * math.tan(vFOV / 2)
+		frustumWidth  = frustumHeight * aspect
+
+		x = (px / width - 0.5) * frustumWidth
+		y = (0.5 - py / height) * frustumHeight
+
+		return x, y, z
+
+	# construct mesh grid:
+	# ---------------
 	positions = []
 	uvs = []
 	indices = []
-
 	idx = 0
 
 	for (sliceIdx, px, py, u0, v0, u1, v1) in tqdm(placements, desc="Generating geometry", unit="block"):
-		_, depth = slices[sliceIdx]
-
-		depthBlock = depth[py:py+blockSize+1, px:px+blockSize+1, 0]
-		depthBlock = fill_block_depth(depthBlock)
-
-		def get_position(px_test, py_test):
-			z = depthBlock[py_test - py][px_test - px]
-
-			frustumHeight = 2 * z * math.tan(vFOV / 2)
-			frustumWidth  = frustumHeight * aspect
-
-			x = (px_test / width  - 0.5) * frustumWidth
-			y = (0.5 - py_test / height) * frustumHeight
-
-			return x, y, z
-
-		# quad (CCW)
 		positions += [
-			*get_position(px, py + blockSize),
-			*get_position(px + blockSize, py + blockSize),
-			*get_position(px + blockSize, py),
-			*get_position(px, py)
+			*get_position(sliceIdx, px            , py + blockSize),
+			*get_position(sliceIdx, px + blockSize, py + blockSize),
+			*get_position(sliceIdx, px + blockSize, py            ),
+			*get_position(sliceIdx, px            , py            )
 		]
 
 		uvs += [
@@ -386,19 +423,16 @@ def build_geometry(placements, slices, width, height, blockSize, vFOV, aspect):
 	)
 
 def save_glb(atlas, positions, uvs, indices, out_path):
-	atlas_img = Image.fromarray(atlas, "RGBA")
+	atlas_img = Image.fromarray(atlas)
 	img_bytes = io.BytesIO()
 	atlas_img.save(img_bytes, format="WEBP", quality=90)
-	atlas_img.save("atlas_new.webp")
+	atlas_img.save("atlas_asdf2.webp")
 	img_bytes = img_bytes.getvalue()
 
-	def buf(data):
-		return data.tobytes()
-
 	bin_blob = (
-		buf(positions) +
-		buf(uvs) +
-		buf(indices)
+		positions.tobytes() +
+		uvs.tobytes() +
+		indices.tobytes()
 	)
 
 	model = gltf.GLTF2(
@@ -438,13 +472,14 @@ def save_glb(atlas, positions, uvs, indices, out_path):
 	model.set_binary_blob(bin_blob)
 	model.save_binary(out_path)
 
+# ------------------------------------------- #
 
 def write_slices(orgImagePath, plyPath, outPath):
 	torch.set_default_device('cuda')
 
 	# load original image:
 	# ---------------	
-	print('Reading original image...')
+	print('Reading original image... ', end='', flush=True)
 
 	orgImage = Image.open(orgImagePath)
 	width = orgImage.width
@@ -454,12 +489,16 @@ def write_slices(orgImagePath, plyPath, outPath):
 	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * width)
 	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * height)
 
+	print('done')
+
 	# load ply:
 	# ---------------	
-	print('Reasing gaussians...')
+	print('Reading gaussians... ', end='', flush=True)
 
 	gaussians, focalY = load_ply(plyPath)
 	fov = 2 * math.atan(outfilledHeight / (2 * focalY))
+
+	print('done')
 
 	# create render settings:
 	# ---------------
@@ -497,16 +536,15 @@ def write_slices(orgImagePath, plyPath, outPath):
 
 		img = np.dstack((color, alpha))
 		img = (img * 255).astype(np.uint8)
-		img = np.flip(img, 1)
 
+		img = np.flip(img, 1)
 		depth = np.flip(depth, 1)
-		# depth[depth == 0.0] = depthSlice.item()
 
 		slices.append((img, depth))
 
 	# replace pixels where GT data exists:
 	# ---------------
-	print('Replacing renders with GT color...')
+	print('Replacing renders with GT color... ', end='', flush=True)
 
 	orgRGB = np.array(orgImage.convert("RGB"), dtype=np.uint8)
 
@@ -523,12 +561,13 @@ def write_slices(orgImagePath, plyPath, outPath):
 		mask = (firstHit == s) & hitAny
 		slices[s][0][mask, :3] = orgRGB[mask]
 
+	print('done')
+
 	# generate geometry:
 	# ---------------
 	atlas, placements = generate_block_atlas(
 		slices,
-		BLOCK_SIZE,
-		REPLACE_ALPHA_THRESHOLD
+		BLOCK_SIZE
 	)
 
 	positions, uvs, indices = build_geometry(
@@ -541,7 +580,13 @@ def write_slices(orgImagePath, plyPath, outPath):
 		aspect
 	)
 
+	# save as GLB:
+	# ---------------
+	print('Writing GLB... ', end='', flush=True)
+
 	save_glb(atlas, positions, uvs, indices, "slices.glb")
+
+	print('done')
 
 def main():
 	write_slices("test/input/t3d.png", "test/output/test.ply", "slices/")
