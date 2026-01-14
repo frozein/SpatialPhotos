@@ -17,11 +17,11 @@ from plyfile import PlyData
 
 OUTFILL_AMOUNT = 0.1
 
-SLICE_MIN_QUANTILE = 0.0
-SLICE_MAX_QUANTILE = 0.8
+DEPTH_MIN_QUANTILE = 0.0
+DEPTH_MAX_QUANTILE = 0.8
 NUM_SLICES = 10
 
-BLOCK_SIZE = 128
+BLOCK_SIZE = 64
 
 ALPHA_REPLACE_THRESHOLD = 0.1
 ALPHA_TEST_THRESHOLD = 0.5
@@ -94,18 +94,14 @@ def load_ply(path, device='cuda'):
 def slice_t(numSlices, idx):
 	return (idx / numSlices) * (idx / numSlices)
 
-def get_slice(gaussians, numSlices, idx, includeBehind = False):
+def get_slice(gaussians, zMin, zMax, numSlices, idx, includeBehind = False):
 	means, scales, rotations, opacities, colors = gaussians
-
-	zMin = torch.quantile(means[:, 2], SLICE_MIN_QUANTILE)
-	zMax = torch.quantile(means[:, 2], SLICE_MAX_QUANTILE)
-	zRange = zMax - zMin
 
 	tMin = slice_t(numSlices, idx)
 	tMax = slice_t(numSlices, idx + 1)
 
-	zMinSlice = zMin + tMin * zRange
-	zMaxSlice = zMin + tMax * zRange
+	zMinSlice = zMin + tMin * (zMax - zMin)
+	zMaxSlice = zMin + tMax * (zMax - zMin)
 	
 	if (idx == numSlices - 1) or includeBehind:
 		where = means[:, 2] >= zMinSlice
@@ -534,16 +530,29 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 
 	# render slices:
 	# ---------------
+	means = gaussians[0]
+	zMin = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
+	zMax = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
+
 	slices = []
 	
 	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice'):
 		render = ddgs.render(
 			settings,
-			*get_slice(gaussians, NUM_SLICES, i)
+			*get_slice(
+				gaussians, 
+				zMin, zMax, 
+				NUM_SLICES, i
+			)
 		)
 		renderBehind = ddgs.render(
 			settings,
-			*get_slice(gaussians, NUM_SLICES, i, includeBehind=True)
+			*get_slice(
+				gaussians, 
+				zMin, zMax, 
+				NUM_SLICES, i, 
+				includeBehind=True
+			)
 		)
 	
 		color = renderBehind.color.detach().cpu().numpy()
@@ -552,6 +561,9 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 
 		img = np.dstack((color, alpha))
 		img = (img * 255).astype(np.uint8)
+
+		depth[depth > zMax] = zMax
+		depth[np.logical_and(depth < zMin, depth > 0)] = zMin
 
 		slices.append((img, depth))
 
@@ -623,7 +635,17 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 	print('done')
 
 def main():
-	mlsharp_to_spatial_photo("test/input/boys.png", "test/output/boys.ply", "boys.glb")
+	names = [
+		"baking", "beach", "boys", "christmas", "friends",
+		"gate", "lights", "money", "road", "vr"
+	]
+
+	for name in names:
+		mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
+
+	# name = "boys"
+	# mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
+
 
 if __name__ == "__main__":
 	main()
