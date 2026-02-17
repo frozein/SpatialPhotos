@@ -6,20 +6,22 @@ import numpy as np
 import torch
 import base64
 import rectpack
-import pygltflib as gltf
 import imageio.v2 as imageio
 
 from PIL import Image
 from tqdm import tqdm
 from plyfile import PlyData
 
+from renderer import render_headless
+from exporter import export_glb
+
 # ------------------------------------------- #
 
-OUTFILL_AMOUNT = 0.1
+OUTFILL_AMOUNT = 0.0
 
 DEPTH_MIN_QUANTILE = 0.0
 DEPTH_MAX_QUANTILE = 0.8
-NUM_SLICES = 10
+NUM_SLICES = 30
 
 BLOCK_SIZE = 64
 
@@ -32,7 +34,9 @@ DEPTH_INFILL_OUTLIER_STD = 2.0
 ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
 
-UV_PADDING = 2.0
+UV_PADDING = 0.0
+
+IPD = 0.064
 
 # ------------------------------------------- #
 
@@ -377,9 +381,10 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 			z = 0
 
 		if checkPrev:
-			_, _, prevZ = get_position(sliceIdx - 1, px, py, False)
-			if z < prevZ:
-				z = prevZ
+			for i in range(0, sliceIdx):
+				_, _, prevZ = get_position(sliceIdx - 1, px, py, False)
+				if z < prevZ:
+					z = prevZ
 
 		x = (px - width  * 0.5) * z / focal
 		y = (height * 0.5 - py) * z / focal
@@ -420,67 +425,13 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 		np.array(indices, dtype=np.uint32)
 	)
 
-def save_glb(atlas, positions, uvs, indices, outPath):
-
-	# encode image to WEBP:
-	# ---------------
-	imgBytes = io.BytesIO()
-
-	atlasImg = Image.fromarray(atlas)
-	atlasImg.save(imgBytes, format="WEBP")
-	imgBytes = imgBytes.getvalue()
-
-	# define GLTF structure:
-	# ---------------
-	binBlob = (
-		positions.tobytes() +
-		uvs.tobytes() +
-		indices.tobytes()
-	)
-
-	model = gltf.GLTF2(
-		asset=gltf.Asset(version="2.0"),
-		buffers=[gltf.Buffer(byteLength=len(binBlob))],
-		bufferViews=[
-			gltf.BufferView(buffer=0, byteOffset=0, byteLength=positions.nbytes, target=gltf.ARRAY_BUFFER),
-			gltf.BufferView(buffer=0, byteOffset=positions.nbytes, byteLength=uvs.nbytes, target=gltf.ARRAY_BUFFER),
-			gltf.BufferView(buffer=0, byteOffset=positions.nbytes + uvs.nbytes, byteLength=indices.nbytes, target=gltf.ELEMENT_ARRAY_BUFFER)
-		],
-		accessors=[
-			gltf.Accessor(bufferView=0, componentType=gltf.FLOAT, count=len(positions)//3, type="VEC3"),
-			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs)//2, type="VEC2"),
-			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices), type="SCALAR")
-		],
-		images=[gltf.Image(uri="data:image/webp;base64," + base64.b64encode(imgBytes).decode())],
-		textures=[gltf.Texture(source=0)],
-		materials=[gltf.Material(
-			pbrMetallicRoughness=gltf.PbrMetallicRoughness(
-				baseColorTexture=gltf.TextureInfo(index=0),
-				metallicFactor=0.0,
-				roughnessFactor=1.0
-			),
-			alphaMode="BLEND",
-			doubleSided=True
-		)],
-		meshes=[gltf.Mesh(primitives=[gltf.Primitive(
-			attributes={"POSITION": 0, "TEXCOORD_0": 1},
-			indices=2,
-			material=0
-		)])],
-		nodes=[gltf.Node(mesh=0)],
-		scenes=[gltf.Scene(nodes=[0])],
-		scene=0
-	)
-
-	model.set_binary_blob(binBlob)
-	
-	# save:
-	# ---------------
-	model.save_binary(outPath)
-
 # ------------------------------------------- #
 
-def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
+def mlsharp_to_spatial_photo(
+	orgImagePath, plyPath, 
+	outGLB, outStereoImage
+	):
+
 	torch.set_default_device('cuda')
 
 	# load original image:
@@ -628,23 +579,67 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outPath):
 
 	# save as GLB:
 	# ---------------
-	print('Writing GLB... ', end='', flush=True)
+	if outGLB is not None:
+		print('Writing GLB... ', end='', flush=True)
 
-	save_glb(atlas, positions, uvs, indices, outPath)
+		export_glb(atlas, positions, uvs, indices, outGLB)
 
-	print('done')
+		print('done')
+
+	# render stereo image:
+	# ---------------
+	if outStereoImage is not None:
+		print('Rendering stereo image... ', end='', flush=True)
+
+		eyeLeft     = torch.tensor([ IPD / 2, 0.0, 0.0])
+		targetLeft  = torch.tensor([ IPD / 2, 0.0, 1.0])
+		viewLeft = look_at(eyeLeft, targetLeft, up)
+
+		eyeRight    = torch.tensor([-IPD / 2, 0.0, 0.0])
+		targetRight = torch.tensor([-IPD / 2, 0.0, 1.0])
+		viewRight = look_at(eyeRight, targetRight, up)
+
+		imgLeft = render_headless(
+			positions, uvs, indices, atlas, 
+			(orgWidth, orgHeight),
+			viewLeft.cpu().numpy(), 
+			proj.cpu().numpy()
+		)
+		imgRight = render_headless(
+			positions, uvs, indices, atlas, 
+			(orgWidth, orgHeight),
+			viewRight.cpu().numpy(), 
+			proj.cpu().numpy()
+		)
+
+		stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
+		stereo.paste(imgLeft, (0, 0))
+		stereo.paste(imgRight, (orgWidth, 0))
+		stereo.save(outStereoImage)
+
+		print('done')
 
 def main():
-	names = [
-		"baking", "beach", "boys", "christmas", "friends",
-		"gate", "lights", "money", "road", "vr"
-	]
+	# names = [
+	# 	"baking", "beach", "boys", "christmas", "friends",
+	# 	"gate", "lights", "money", "road", "vr"
+	# ]
 
-	for name in names:
-		mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
+	# for name in names:
+	# 	mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
 
-	# name = "boys"
-	# mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
+	# name = "frames010"
+
+	numFrames = 59
+	for idx in range(59, numFrames + 1):
+		mlsharp_to_spatial_photo(
+			orgImagePath=f"clip/frames/frames{idx:03d}.png", 
+			plyPath=f"clip/gaussians/frames{idx:03d}.ply", 
+			outGLB=f"clip/glbs/frame_{idx:03d}.glb",
+			outStereoImage=None
+		)
+
+		print(f"FINISHED {idx}/{numFrames}\n")
 
 
 if __name__ == "__main__":
