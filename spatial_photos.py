@@ -768,11 +768,11 @@ def main():
 
 
 if __name__ == "__main__":
-	# main()
+	main()
 
-	mlsharp_to_spatial_photo(
-		orgImagePath="insidious/clip2/frames/frame_040.png",
-		plyPath="insidious/clip2/plys/frame_040.ply",
-		outGLB="insidious/clip2/glbs/frame_040.glb",
-		outStereoImage="insidious/clip2/stereo/frame_040.png",
-	)
+	# mlsharp_to_spatial_photo(
+	# 	orgImagePath="insidious/clip2/frames/frame_045.png",
+	# 	plyPath="insidious/clip2/plys/frame_045.ply",
+	# 	outGLB="insidious/clip2/glbs/frame_045.glb",
+	# 	outStereoImage="insidious/clip2/stereo/frame_045.png",
+	# )
