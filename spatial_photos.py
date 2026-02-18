@@ -299,6 +299,71 @@ def generate_block_atlas(slices, blockSize):
 
 	return atlas, placements
 
+def generate_block_atlas_fast(slices, blockSize):
+
+	allBlocks = []
+	placementsMeta = []
+
+	# collect every individual block:
+	# ---------------
+	for idx, (img, depth) in enumerate(tqdm(slices, desc="Extracting blocks", unit="slice")):
+		mask, blocks = extract_blocks(img, blockSize)
+		if not np.any(mask):
+			continue
+
+		for (gx, gy), block in blocks.items():
+			if not mask[gy, gx]:
+				continue
+
+			px = gx * blockSize
+			py = gy * blockSize
+
+			allBlocks.append((blockSize, blockSize, block, [(gx, gy)]))
+			placementsMeta.append((idx, px, py, blockSize, blockSize))
+
+	# find smallest square atlas that fits all blocks:
+	# ---------------
+	print("Packing blocks into atlas... ", end='', flush=True)
+
+	n = len(allBlocks)
+	blocksPerSide = math.ceil(math.sqrt(n))
+	atlasSize = blocksPerSide * blockSize
+
+	atlasWidth = atlasSize
+	atlasHeight = atlasSize
+	atlas = np.zeros((atlasHeight, atlasWidth, 4), dtype=np.uint8)
+
+	placements = []
+
+	for i, (bw, bh, imgBlock, blockCoords) in enumerate(allBlocks):
+		col = i % blocksPerSide
+		row = i // blocksPerSide
+
+		ax = col * blockSize
+		ay = row * blockSize
+
+		atlas[ay:ay+bh, ax:ax+bw] = imgBlock
+
+		idx, _, _, _, _ = placementsMeta[i]
+
+		u0 = (ax + UV_PADDING) / atlasWidth
+		v0 = (ay + UV_PADDING) / atlasHeight
+		u1 = (ax + blockSize - UV_PADDING) / atlasWidth
+		v1 = (ay + blockSize - UV_PADDING) / atlasHeight
+
+		gx, gy = blockCoords[0]
+		bx = gx * blockSize
+		by = gy * blockSize
+
+		placements.append((idx, bx, by, u0, v1, u1, v0))
+
+	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
+	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
+
+	print('done')
+
+	return atlas, placements
+
 # ------------------------------------------- #
 
 def fill_block_depth(depthBlock):
@@ -382,7 +447,7 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 		if checkPrev:
 			for i in range(0, sliceIdx):
-				_, _, prevZ = get_position(sliceIdx - 1, px, py, False)
+				_, _, prevZ = get_position(i, px, py, False)
 				if z < prevZ:
 					z = prevZ
 
@@ -398,6 +463,7 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 	indices = []
 	idx = 0
 
+	placements = sorted(placements, key=lambda x: x[0])
 	for (sliceIdx, px, py, u0, v0, u1, v1) in tqdm(placements, desc="Generating geometry", unit="block"):
 		positions += [
 			*get_position(sliceIdx, px            , py + blockSize),
@@ -562,10 +628,16 @@ def mlsharp_to_spatial_photo(
 
 	# generate geometry:
 	# ---------------
-	atlas, placements = generate_block_atlas(
-		slices,
-		BLOCK_SIZE
-	)
+	if outGLB is None:
+		atlas, placements = generate_block_atlas_naive(
+			slices,
+			BLOCK_SIZE
+		)
+	else:
+		atlas, placements = generate_block_atlas(
+			slices,
+			BLOCK_SIZE
+		)
 
 	positions, uvs, indices = build_geometry(
 		placements,
@@ -619,28 +691,88 @@ def mlsharp_to_spatial_photo(
 
 		print('done')
 
+# TODO: AI SLOP!!!!!
+
+import os
+import re
+import argparse
+from pathlib import Path
+
+
 def main():
-	# names = [
-	# 	"baking", "beach", "boys", "christmas", "friends",
-	# 	"gate", "lights", "money", "road", "vr"
-	# ]
+	parser = argparse.ArgumentParser(
+		description="Batch process frame_N.png and frame_N.ply pairs."
+	)
 
-	# for name in names:
-	# 	mlsharp_to_spatial_photo(f"test/input/{name}.png", f"test/output/{name}.ply", f"{name}.glb")
+	parser.add_argument("--image_dir", required=True,
+						help="Directory containing frame_XXX.png images")
+	parser.add_argument("--ply_dir", required=True,
+						help="Directory containing frame_XXX.ply files")
 
-	# name = "frames010"
+	parser.add_argument("--out_glb_dir", default=None,
+						help="Output directory for GLB files (optional)")
+	parser.add_argument("--out_png_dir", default=None,
+						help="Output directory for stereo PNG files (optional)")
 
-	numFrames = 59
-	for idx in range(59, numFrames + 1):
+	args = parser.parse_args()
+
+	image_dir = Path(args.image_dir)
+	ply_dir   = Path(args.ply_dir)
+
+	out_glb_dir = Path(args.out_glb_dir) if args.out_glb_dir else None
+	out_png_dir = Path(args.out_png_dir) if args.out_png_dir else None
+
+	if out_glb_dir:
+		out_glb_dir.mkdir(parents=True, exist_ok=True)
+
+	if out_png_dir:
+		out_png_dir.mkdir(parents=True, exist_ok=True)
+
+	pattern = re.compile(r"frame_?(\d+)\.png$")
+
+	image_files = sorted(image_dir.glob("*.png"))
+
+	pairs = []
+
+	for img_path in image_files:
+		match = pattern.search(img_path.name)
+		if not match:
+			continue
+
+		idx = match.group(1)
+
+		# Look for matching PLY
+		ply_path = ply_dir / f"frame_{idx}.ply"
+		if not ply_path.exists():
+			ply_path = ply_dir / f"frame{idx}.ply"
+
+		if ply_path.exists():
+			pairs.append((idx, img_path, ply_path))
+
+	total = len(pairs)
+	print(f"Found {total} matching frame pairs\n")
+
+	for i, (idx, img_path, ply_path) in enumerate(pairs, 1):
+
+		out_glb = out_glb_dir / f"frame_{idx}.glb" if out_glb_dir else None
+		out_png = out_png_dir / f"frame_{idx}.png" if out_png_dir else None
+
 		mlsharp_to_spatial_photo(
-			orgImagePath=f"clip/frames/frames{idx:03d}.png", 
-			plyPath=f"clip/gaussians/frames{idx:03d}.ply", 
-			outGLB=f"clip/glbs/frame_{idx:03d}.glb",
-			outStereoImage=None
+			orgImagePath=str(img_path),
+			plyPath=str(ply_path),
+			outGLB=str(out_glb) if out_glb else None,
+			outStereoImage=str(out_png) if out_png else None
 		)
 
-		print(f"FINISHED {idx}/{numFrames}\n")
+		print(f"FINISHED {i}/{total} (frame_{idx})\n")
 
 
 if __name__ == "__main__":
-	main()
+	# main()
+
+	mlsharp_to_spatial_photo(
+		orgImagePath="insidious/clip2/frames/frame_040.png",
+		plyPath="insidious/clip2/plys/frame_040.ply",
+		outGLB="insidious/clip2/glbs/frame_040.glb",
+		outStereoImage="insidious/clip2/stereo/frame_040.png",
+	)
