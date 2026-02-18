@@ -629,7 +629,7 @@ def mlsharp_to_spatial_photo(
 	# generate geometry:
 	# ---------------
 	if outGLB is None:
-		atlas, placements = generate_block_atlas_naive(
+		atlas, placements = generate_block_atlas_fast(
 			slices,
 			BLOCK_SIZE
 		)
