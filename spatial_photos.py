@@ -702,6 +702,7 @@ def mlsharp_to_spatial_photo(
 			renderer.release_scene(scene)
 
 if __name__ == "__main__":
+	pass
 	# main()
 
 	# mlsharp_to_spatial_photo(
