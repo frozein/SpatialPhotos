@@ -83,7 +83,7 @@ def load_ply(path, device='cuda'):
 
 	def np_to_torch(name, dim=1):
 		arr = np.stack([vertex[n] for n in name], axis=-1) if isinstance(name, (list, tuple)) else vertex[name]
-		return torch.tensor(arr, dtype=torch.float32, device=device)
+		return torch.tensor(arr, dtype=torch.float32, device=device, requires_grad=False)
 
 	means = np_to_torch(['x', 'y', 'z'])
 	colors = 0.5 + np_to_torch(['f_dc_0', 'f_dc_1', 'f_dc_2']) * 0.28209479177387814 # convert to SH
@@ -565,23 +565,24 @@ def mlsharp_to_spatial_photo(
 	slices = []
 	
 	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice', disable=not DEBUG):
-		render = ddgs.render(
-			settings,
-			*get_slice(
-				gaussians, 
-				zMin, zMax, 
-				NUM_SLICES, i
+		with torch.no_grad():
+			render = ddgs.render(
+				settings,
+				*get_slice(
+					gaussians, 
+					zMin, zMax, 
+					NUM_SLICES, i
+				)
 			)
-		)
-		renderBehind = ddgs.render(
-			settings,
-			*get_slice(
-				gaussians, 
-				zMin, zMax, 
-				NUM_SLICES, i, 
-				includeBehind=True
+			renderBehind = ddgs.render(
+				settings,
+				*get_slice(
+					gaussians, 
+					zMin, zMax, 
+					NUM_SLICES, i, 
+					includeBehind=True
+				)
 			)
-		)
 
 		imgCuda = torch.dstack((renderBehind.color.detach(), render.alpha.detach()))
 		imgCuda = (imgCuda * 255).to(dtype=torch.uint8)
@@ -702,18 +703,18 @@ def mlsharp_to_spatial_photo(
 			renderer.release_scene(scene)
 
 if __name__ == "__main__":
-	pass
+	# pass
 	# main()
 
-	# mlsharp_to_spatial_photo(
-	# 	orgImagePath="insidious/clip2/frames/frame_045.png",
-	# 	plyPath="insidious/clip2/plys/frame_045.ply",
-	# 	outGLB=None,
-	# 	outStereoImages=[
-	# 		(0.064, "test_ipd_64.png"),
-	# 		(0.032, "test_ipd_32.png"),
-	# 		(0.016, "test_ipd_16.png"),
-	# 		(0.008, "test_ipd_08.png")
-	# 	],
-	# 	debug=True
-	# )
+	mlsharp_to_spatial_photo(
+		orgImagePath="insidious/clip2/frames/frame_045.png",
+		plyPath="insidious/clip2/plys/frame_045.ply",
+		outGLB=None,
+		outStereoImages=[
+			(0.064, "test_ipd_64.png"),
+			(0.032, "test_ipd_32.png"),
+			(0.016, "test_ipd_16.png"),
+			(0.008, "test_ipd_08.png")
+		],
+		debug=True
+	)
