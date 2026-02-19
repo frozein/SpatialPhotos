@@ -51,12 +51,10 @@ def worker(
 	sharedTotal: Array,
 	sharedStartTimes: Value,
 ):
-	# set environment variables, import processing script:
+	# set environment variables:
 	# ---------------
 	os.environ["DISPLAY"] = f":{displayId}.0"
 	os.environ["CUDA_VISIBLE_DEVICES"] = str(gpuId)
-
-	from spatial_photos import mlsharp_to_spatial_photo
 
 	# get frames to process:
 	# ---------------
@@ -75,8 +73,10 @@ def worker(
 		flush=True,
 	)
 
-	# process each frame:
+	# process each frame in its own subprocess so memory is guaranteed freed between frames:
 	# ---------------
+	processFrameScript = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spatial_photos.py")
+
 	for i, framePath in enumerate(myFrames):
 		frameNum = get_frame_number(framePath)
 		frameStem = os.path.splitext(os.path.basename(framePath))[0]
@@ -87,27 +87,34 @@ def worker(
 				f"[Worker {workerId:03d}] WARNING: PLY not found for {framePath}, skipping.",
 				flush=True,
 			)
-
 			sharedDone[workerId] += 1
 			continue
 
-		outStereo = [
-			(ipd, os.path.join(outDir, f"ipd_{int(ipd * 1000):03d}", f"frame_{frameNum:06d}.png"))
+		# encode as "ipd:path" pairs for the subprocess
+		outStereoArgs = [
+			f"{ipd}:{os.path.join(outDir, f'ipd_{int(ipd * 1000):03d}', f'frame_{frameNum:06d}.png')}"
 			for ipd in outStereoIpds
 		]
 
+		cmd = [
+			sys.executable, processFrameScript,
+			"--org-image",  framePath,
+			"--ply",        plyPath,
+			"--out-stereo", *outStereoArgs,
+		]
+
 		t0 = time.time()
-		try:
-			mlsharp_to_spatial_photo(
-				orgImagePath=framePath,
-				plyPath=plyPath,
-				outGLB=None,
-				outStereoImages=outStereo,
-			)
-		except Exception as e:
-			print(f"[Worker {workerId:03d}] ERROR on frame {frameNum}: {e}", flush=True)
+		result = subprocess.run(cmd, env=os.environ.copy())
+		elapsed = time.time() - t0
 
 		sharedDone[workerId] += 1
+
+		if result.returncode != 0:
+			print(
+				f"[Worker {workerId:03d}] ERROR on frame {frameNum}: "
+				f"subprocess exited with code {result.returncode}",
+				flush=True,
+			)
 
 		completed = i + 1
 		remaining = len(myFrames) - completed
@@ -216,8 +223,8 @@ def main():
 
 	# create shared memory:
 	# ---------------
-	sharedDone     = Array(c_int,    [0] * N)
-	sharedTotal    = Array(c_int,    [0] * N)
+	sharedDone       = Array(c_int,    [0] * N)
+	sharedTotal      = Array(c_int,    [0] * N)
 	sharedStartTimes = Value(c_double, 0.0)
 
 	# start xvfb for each process:
@@ -234,7 +241,7 @@ def main():
 
 	workers = []
 	for k in range(N):
-		gpuId      = k % M
+		gpuId     = k % M
 		displayId = args.base_display + k
 		p = Process(
 			target=worker,
@@ -287,7 +294,7 @@ def main():
 	# ---------------
 	totalDone   = sum(sharedDone[k]  for k in range(N))
 	totalFrames = sum(sharedTotal[k] for k in range(N))
-	elapsed      = time.time() - sharedStartTimes.value
+	elapsed     = time.time() - sharedStartTimes.value
 
 	print(f"\n✓ All workers finished.  {totalDone}/{totalFrames} frames in {fmt_duration(elapsed)}.")
 

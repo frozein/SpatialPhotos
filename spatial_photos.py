@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import base64
 import rectpack
+import argparse
 import imageio.v2 as imageio
 
 from PIL import Image
@@ -702,19 +703,33 @@ def mlsharp_to_spatial_photo(
 		finally:
 			renderer.release_scene(scene)
 
-if __name__ == "__main__":
-	# pass
-	# main()
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--org-image",  required=True)
+	parser.add_argument("--ply",        required=True)
+	parser.add_argument("--out-stereo", nargs="+", default=None,
+						help="One or more ipd:path pairs, e.g. 0.064:out/ipd_064/frame_000045.png")
+	parser.add_argument("--out-glb", default=None)
+	
+	args = parser.parse_args()
+
+	if args.out_stereo is not None:
+		outStereoImages = []
+		for token in args.out_stereo:
+			ipd_str, _, path = token.partition(":")
+			if not path:
+				print(f"ERROR: malformed --out-stereo token '{token}' (expected 'ipd:path')", file=sys.stderr)
+				sys.exit(1)
+			outStereoImages.append((float(ipd_str), path))
+	else:
+		outStereoImages = None
 
 	mlsharp_to_spatial_photo(
-		orgImagePath="insidious/clip2/frames/frame_045.png",
-		plyPath="insidious/clip2/plys/frame_045.ply",
-		outGLB=None,
-		outStereoImages=[
-			(0.064, "test_ipd_64.png"),
-			(0.032, "test_ipd_32.png"),
-			(0.016, "test_ipd_16.png"),
-			(0.008, "test_ipd_08.png")
-		],
-		debug=True
+		orgImagePath=args.org_image,
+		plyPath=args.ply,
+		outGLB=args.out_glb,
+		outStereoImages=outStereoImages,
 	)
+
+if __name__ == "__main__":
+	main()
