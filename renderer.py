@@ -33,7 +33,7 @@ prog = ctx.program(
 	''',
 )
 
-def render_headless(positions, uvs, indices, atlas_img, output_size, view, proj):
+def upload_scene(positions, uvs, indices, atlas_img, output_size):
 	width, height = output_size
 
 	# ... [Texture Code remains the same] ...
@@ -61,6 +61,27 @@ def render_headless(positions, uvs, indices, atlas_img, output_size, view, proj)
 		(vbo, '3f 2f', 'in_vert', 'in_text')
 	], index_buffer=ibo)
 
+	fbo = ctx.simple_framebuffer((width, height))
+
+	return {
+		'texture': texture,
+		'vbo':     vbo,
+		'ibo':     ibo,
+		'vao':     vao,
+		'fbo':     fbo,
+		'size':    output_size,
+	}
+
+def release_scene(scene):
+	scene['vao'].release()
+	scene['vbo'].release()
+	scene['ibo'].release()
+	scene['texture'].release()
+	scene['fbo'].release()
+
+def render_view(scene, view, proj):
+	
+
 	# ---------------------------------------------------------
 	# FIX 2: Matrix Transposition
 	# ---------------------------------------------------------
@@ -78,20 +99,15 @@ def render_headless(positions, uvs, indices, atlas_img, output_size, view, proj)
 	prog['m_proj'].write(m_proj.tobytes())
 
 	# ... [Rendering Code remains the same] ...
-	fbo = ctx.simple_framebuffer((width, height))
-	fbo.use()
-	fbo.clear(0.0, 0.0, 0.0, 1.0)
+	scene['fbo'].use()
+	scene['fbo'].clear(0.0, 0.0, 0.0, 1.0)
 	
-	vao.render(moderngl.TRIANGLES)
+	scene['vao'].render(moderngl.TRIANGLES)
+
+	width, height = scene['size']
 	
-	raw_data = fbo.read(components=4, dtype='f1')
+	raw_data = scene['fbo'].read(components=4, dtype='f1')
 	img = Image.frombytes('RGBA', (width, height), raw_data)
 	img = img.transpose(Image.FLIP_TOP_BOTTOM)
-
-	vao.release()
-	vbo.release()
-	ibo.release()
-	texture.release()
-	fbo.release()
 
 	return img

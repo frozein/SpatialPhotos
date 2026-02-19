@@ -12,8 +12,8 @@ from PIL import Image
 from tqdm import tqdm
 from plyfile import PlyData
 
-from renderer import render_headless
-from exporter import export_glb
+import renderer
+import exporter
 
 # ------------------------------------------- #
 
@@ -37,6 +37,13 @@ ATLAS_MAX_SIZE = 8192
 UV_PADDING = 0.0
 
 IPD = 0.064
+
+# ------------------------------------------- #
+
+DEBUG = False
+def dprint(*args, **kwargs):
+	if DEBUG:
+		print(*args, **kwargs)
 
 # ------------------------------------------- #
 
@@ -246,7 +253,7 @@ def generate_block_atlas(slices, blockSize):
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, depth) in enumerate(tqdm(slices, desc="Greedy meshing slices", unit="slice")):
+	for idx, (img, depth) in enumerate(tqdm(slices, desc="Greedy meshing slices", unit="slice", disable=not DEBUG)):
 		mask, blocks = extract_blocks(img, blockSize)
 		if not np.any(mask):
 			continue
@@ -260,7 +267,7 @@ def generate_block_atlas(slices, blockSize):
 
 	# pack greedy meshed rects into atlas:
 	# ---------------
-	print("Packing slices into atlas... ", end='', flush=True)
+	dprint("Packing slices into atlas... ", end='', flush=True)
 
 	packer = pack_blocks(mergedBlocks)
 
@@ -295,7 +302,7 @@ def generate_block_atlas(slices, blockSize):
 	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
 	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
 
-	print('done')
+	dprint('done')
 
 	return atlas, placements
 
@@ -306,7 +313,7 @@ def generate_block_atlas_fast(slices, blockSize):
 
 	# collect every individual block:
 	# ---------------
-	for idx, (img, depth) in enumerate(tqdm(slices, desc="Extracting blocks", unit="slice")):
+	for idx, (img, depth) in enumerate(tqdm(slices, desc="Extracting blocks", unit="slice", disable=not DEBUG)):
 		mask, blocks = extract_blocks(img, blockSize)
 		if not np.any(mask):
 			continue
@@ -323,7 +330,7 @@ def generate_block_atlas_fast(slices, blockSize):
 
 	# find smallest square atlas that fits all blocks:
 	# ---------------
-	print("Packing blocks into atlas... ", end='', flush=True)
+	dprint("Packing blocks into atlas... ", end='', flush=True)
 
 	n = len(allBlocks)
 	blocksPerSide = math.ceil(math.sqrt(n))
@@ -360,7 +367,7 @@ def generate_block_atlas_fast(slices, blockSize):
 	atlas[...][atlas[..., 3] < ALPHA_TEST_THRESHOLD * 255] = [0, 0, 0, 0]
 	atlas[..., 3][atlas[..., 3] >= ALPHA_TEST_THRESHOLD * 255] = 255
 
-	print('done')
+	dprint('done')
 
 	return atlas, placements
 
@@ -411,7 +418,7 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 	# infill depth for each block:
 	# ---------------
 	blockDepths = {}
-	for (sliceIdx, px, py, _, _, _, _) in tqdm(placements, desc="Filling block depths", unit="block"):
+	for (sliceIdx, px, py, _, _, _, _) in tqdm(placements, desc="Filling block depths", unit="block", disable=not DEBUG):
 		_, depth = slices[sliceIdx]
 
 		depthBlock = depth[py:py+blockSize, px:px+blockSize, 0]
@@ -464,7 +471,7 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 	idx = 0
 
 	placements = sorted(placements, key=lambda x: x[0])
-	for (sliceIdx, px, py, u0, v0, u1, v1) in tqdm(placements, desc="Generating geometry", unit="block"):
+	for (sliceIdx, px, py, u0, v0, u1, v1) in tqdm(placements, desc="Generating geometry", unit="block", disable=not DEBUG):
 		positions += [
 			*get_position(sliceIdx, px            , py + blockSize),
 			*get_position(sliceIdx, px + blockSize, py + blockSize),
@@ -495,14 +502,18 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 def mlsharp_to_spatial_photo(
 	orgImagePath, plyPath, 
-	outGLB, outStereoImage
+	outGLB, outStereoImages,
+	debug=False
 	):
 
 	torch.set_default_device('cuda')
 
+	global DEBUG
+	DEBUG = debug
+
 	# load original image:
 	# ---------------	
-	print('Reading original image... ', end='', flush=True)
+	dprint('Reading original image... ', end='', flush=True)
 
 	orgImage = Image.open(orgImagePath)
 	orgWidth = orgImage.width
@@ -516,16 +527,16 @@ def mlsharp_to_spatial_photo(
 
 	aspect = outfilledWidth / outfilledHeight
 
-	print('done')
+	dprint('done')
 
 	# load ply:
 	# ---------------	
-	print('Reading gaussians... ', end='', flush=True)
+	dprint('Reading gaussians... ', end='', flush=True)
 
 	gaussians, focalY = load_ply(plyPath)
 	fov = 2 * math.atan(outfilledHeight / (2 * focalY))
 
-	print('done')
+	dprint('done')
 
 	# create render settings:
 	# ---------------
@@ -553,7 +564,7 @@ def mlsharp_to_spatial_photo(
 
 	slices = []
 	
-	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice'):
+	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice', disable=not DEBUG):
 		render = ddgs.render(
 			settings,
 			*get_slice(
@@ -571,22 +582,21 @@ def mlsharp_to_spatial_photo(
 				includeBehind=True
 			)
 		)
-	
-		color = renderBehind.color.detach().cpu().numpy()
-		alpha = render.alpha.detach().cpu().numpy()
-		depth = render.depth.detach().cpu().numpy()
 
-		img = np.dstack((color, alpha))
-		img = (img * 255).astype(np.uint8)
+		imgCuda = torch.dstack((renderBehind.color.detach(), render.alpha.detach()))
+		imgCuda = (imgCuda * 255).to(dtype=torch.uint8)
 
-		depth[depth > zMax] = zMax
-		depth[np.logical_and(depth < zMin, depth > 0)] = zMin
+		depthCuda = render.depth.detach()
+		depthCuda[depthCuda > zMax] = zMax
+		depthCuda[(depthCuda < zMin) & (depthCuda > 0)] = zMin
 
+		img = imgCuda.cpu().numpy()
+		depth = depthCuda.cpu().numpy()
 		slices.append((img, depth))
 
 	# replace pixels where GT data exists:
 	# ---------------
-	print('Replacing renders with GT color... ', end='', flush=True)
+	dprint('Replacing renders with GT color... ', end='', flush=True)
 
 	orgRGB = np.array(orgImage.convert("RGB"), dtype=np.uint8)
 	orgRGB = np.flip(orgRGB, 1)
@@ -624,7 +634,7 @@ def mlsharp_to_spatial_photo(
 
 		slices[s][0][mask, :3] = orgRGB[orgY, orgX]
 
-	print('done')
+	dprint('done')
 
 	# generate geometry:
 	# ---------------
@@ -652,127 +662,57 @@ def mlsharp_to_spatial_photo(
 	# save as GLB:
 	# ---------------
 	if outGLB is not None:
-		print('Writing GLB... ', end='', flush=True)
+		dprint('Writing GLB... ', end='', flush=True)
 
 		export_glb(atlas, positions, uvs, indices, outGLB)
 
-		print('done')
+		dprint('done')
 
 	# render stereo image:
 	# ---------------
-	if outStereoImage is not None:
-		print('Rendering stereo image... ', end='', flush=True)
+	if outStereoImages is not None:
+		scene = renderer.upload_scene(positions, uvs, indices, atlas, (orgWidth, orgHeight))
 
-		eyeLeft     = torch.tensor([ IPD / 2, 0.0, 0.0])
-		targetLeft  = torch.tensor([ IPD / 2, 0.0, 1.0])
-		viewLeft = look_at(eyeLeft, targetLeft, up)
+		try:
+			for (ipd, path) in tqdm(outStereoImages, desc='Rendering stereo images', unit='image', disable=not DEBUG):
+				eyeLeft     = torch.tensor([ ipd / 2, 0.0, 0.0])
+				targetLeft  = torch.tensor([ ipd / 2, 0.0, 1.0])
+				viewLeft = look_at(eyeLeft, targetLeft, up)
 
-		eyeRight    = torch.tensor([-IPD / 2, 0.0, 0.0])
-		targetRight = torch.tensor([-IPD / 2, 0.0, 1.0])
-		viewRight = look_at(eyeRight, targetRight, up)
+				eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
+				targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
+				viewRight = look_at(eyeRight, targetRight, up)
 
-		imgLeft = render_headless(
-			positions, uvs, indices, atlas, 
-			(orgWidth, orgHeight),
-			viewLeft.cpu().numpy(), 
-			proj.cpu().numpy()
-		)
-		imgRight = render_headless(
-			positions, uvs, indices, atlas, 
-			(orgWidth, orgHeight),
-			viewRight.cpu().numpy(), 
-			proj.cpu().numpy()
-		)
+				imgLeft = renderer.render_view(
+					scene,
+					viewLeft.cpu().numpy(), 
+					proj.cpu().numpy()
+				)
+				imgRight = renderer.render_view(
+					scene,
+					viewRight.cpu().numpy(), 
+					proj.cpu().numpy()
+				)
 
-		stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
-		stereo.paste(imgLeft, (0, 0))
-		stereo.paste(imgRight, (orgWidth, 0))
-		stereo.save(outStereoImage)
-
-		print('done')
-
-# TODO: AI SLOP!!!!!
-
-import os
-import re
-import argparse
-from pathlib import Path
-
-
-def main():
-	parser = argparse.ArgumentParser(
-		description="Batch process frame_N.png and frame_N.ply pairs."
-	)
-
-	parser.add_argument("--image_dir", required=True,
-						help="Directory containing frame_XXX.png images")
-	parser.add_argument("--ply_dir", required=True,
-						help="Directory containing frame_XXX.ply files")
-
-	parser.add_argument("--out_glb_dir", default=None,
-						help="Output directory for GLB files (optional)")
-	parser.add_argument("--out_png_dir", default=None,
-						help="Output directory for stereo PNG files (optional)")
-
-	args = parser.parse_args()
-
-	image_dir = Path(args.image_dir)
-	ply_dir   = Path(args.ply_dir)
-
-	out_glb_dir = Path(args.out_glb_dir) if args.out_glb_dir else None
-	out_png_dir = Path(args.out_png_dir) if args.out_png_dir else None
-
-	if out_glb_dir:
-		out_glb_dir.mkdir(parents=True, exist_ok=True)
-
-	if out_png_dir:
-		out_png_dir.mkdir(parents=True, exist_ok=True)
-
-	pattern = re.compile(r"frame_?(\d+)\.png$")
-
-	image_files = sorted(image_dir.glob("*.png"))
-
-	pairs = []
-
-	for img_path in image_files:
-		match = pattern.search(img_path.name)
-		if not match:
-			continue
-
-		idx = match.group(1)
-
-		# Look for matching PLY
-		ply_path = ply_dir / f"frame_{idx}.ply"
-		if not ply_path.exists():
-			ply_path = ply_dir / f"frame{idx}.ply"
-
-		if ply_path.exists():
-			pairs.append((idx, img_path, ply_path))
-
-	total = len(pairs)
-	print(f"Found {total} matching frame pairs\n")
-
-	for i, (idx, img_path, ply_path) in enumerate(pairs, 1):
-
-		out_glb = out_glb_dir / f"frame_{idx}.glb" if out_glb_dir else None
-		out_png = out_png_dir / f"frame_{idx}.png" if out_png_dir else None
-
-		mlsharp_to_spatial_photo(
-			orgImagePath=str(img_path),
-			plyPath=str(ply_path),
-			outGLB=str(out_glb) if out_glb else None,
-			outStereoImage=str(out_png) if out_png else None
-		)
-
-		print(f"FINISHED {i}/{total} (frame_{idx})\n")
-
+				stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
+				stereo.paste(imgLeft, (0, 0))
+				stereo.paste(imgRight, (orgWidth, 0))
+				stereo.save(path)
+		finally:
+			renderer.release_scene(scene)
 
 if __name__ == "__main__":
-	main()
+	# main()
 
 	# mlsharp_to_spatial_photo(
 	# 	orgImagePath="insidious/clip2/frames/frame_045.png",
 	# 	plyPath="insidious/clip2/plys/frame_045.ply",
-	# 	outGLB="insidious/clip2/glbs/frame_045.glb",
-	# 	outStereoImage="insidious/clip2/stereo/frame_045.png",
+	# 	outGLB=None,
+	# 	outStereoImages=[
+	# 		(0.064, "test_ipd_64.png"),
+	# 		(0.032, "test_ipd_32.png"),
+	# 		(0.016, "test_ipd_16.png"),
+	# 		(0.008, "test_ipd_08.png")
+	# 	],
+	# 	debug=True
 	# )
