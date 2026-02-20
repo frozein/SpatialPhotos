@@ -9,7 +9,7 @@ import threading
 import time
 from ctypes import c_double, c_int
 from datetime import timedelta
-from multiprocessing import Array, Process, Value
+from multiprocessing import Array, Process, Value, Lock
 
 # ------------------------------------------- #
 
@@ -17,7 +17,6 @@ def get_frame_number(path: str) -> int:
 	match = re.search(r"(\d+)", os.path.basename(path))
 	if not match:
 		raise ValueError(f"Could not extract frame number from {path}")
-
 	return int(match.group(1))
 
 
@@ -25,160 +24,103 @@ def start_xvfb(displayId: int) -> subprocess.Popen:
 	cmd = ["Xvfb", f":{displayId}", "-screen", "0", "640x480x24"]
 	proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 	time.sleep(0.5)
-
 	return proc
 
 
 def fmt_duration(seconds: float) -> str:
 	if seconds < 0 or seconds != seconds:
 		return "??:??:??"
-
 	return str(timedelta(seconds=int(seconds)))
 
 # ------------------------------------------- #
 
 def worker(
-	workerId: int,
-	numWorkers: int,
+	slotId: int,
 	gpuId: int,
 	displayId: int,
+	frameBatch: list,       # list of (framePath, plyPath, outStereoImages) for this batch
 	framesDir: str,
 	plysDir: str,
 	outStereoIpds: list,
 	outDir: str,
-	
-	sharedDone: Array,
-	sharedTotal: Array,
-	sharedStartTimes: Value,
+	sharedDone: Array,      # one global counter
+	sharedStartTime: Value,
 ):
-	# set environment variables:
-	# ---------------
+	"""
+	Processes exactly one batch of frames (up to K), then exits.
+	slotId is just used for display/logging — it's the slot index (0..N-1),
+	not a persistent worker identity.
+	"""
 	os.environ["DISPLAY"] = f":{displayId}.0"
 	os.environ["CUDA_VISIBLE_DEVICES"] = str(gpuId)
 
-	# get frames to process:
-	# ---------------
-	framePaths = sorted(
-		glob.glob(os.path.join(framesDir, "*.png")),
-		key=get_frame_number,
-	)
-	myFrames = [p for p in framePaths if get_frame_number(p) % numWorkers == workerId]
-
-	sharedTotal[workerId] = len(myFrames)
-	sharedDone[workerId] = 0
+	from spatial_photos import mlsharp_to_spatial_photo
 
 	print(
-		f"[Worker {workerId:03d}] GPU={gpuId}  DISPLAY=:{displayId}.0  "
-		f"Frames assigned: {len(myFrames)}",
+		f"[Slot {slotId:02d}] GPU={gpuId}  DISPLAY=:{displayId}.0  "
+		f"Batch of {len(frameBatch)} frames  "
+		f"(frames {get_frame_number(frameBatch[0][0]):06d}–{get_frame_number(frameBatch[-1][0]):06d})",
 		flush=True,
 	)
 
-	# process each frame in its own subprocess so memory is guaranteed freed between frames:
-	# ---------------
-	processFrameScript = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spatial_photos.py")
-
-	for i, framePath in enumerate(myFrames):
+	for framePath, plyPath, outStereoImages in frameBatch:
 		frameNum = get_frame_number(framePath)
-		frameStem = os.path.splitext(os.path.basename(framePath))[0]
-
-		plyPath = os.path.join(plysDir, f"{frameStem}.ply")
-		if not os.path.exists(plyPath):
-			print(
-				f"[Worker {workerId:03d}] WARNING: PLY not found for {framePath}, skipping.",
-				flush=True,
-			)
-			sharedDone[workerId] += 1
-			continue
-
-		# encode as "ipd:path" pairs for the subprocess
-		outStereoArgs = [
-			f"{ipd}:{os.path.join(outDir, f'ipd_{int(ipd * 1000):03d}', f'frame_{frameNum:06d}.png')}"
-			for ipd in outStereoIpds
-		]
-
-		cmd = [
-			sys.executable, processFrameScript,
-			"--org-image",  framePath,
-			"--ply",        plyPath,
-			"--out-stereo", *outStereoArgs,
-		]
 
 		t0 = time.time()
-		result = subprocess.run(cmd, env=os.environ.copy())
+		try:
+			import torch
+			with torch.no_grad():
+				mlsharp_to_spatial_photo(
+					orgImagePath=framePath,
+					plyPath=plyPath,
+					outGLB=None,
+					outStereoImages=outStereoImages,
+				)
+		except Exception as e:
+			print(f"[Slot {slotId:02d}] ERROR on frame {frameNum}: {e}", flush=True)
+
 		elapsed = time.time() - t0
+		sharedDone[0] += 1
+		done = sharedDone[0]
 
-		sharedDone[workerId] += 1
+		workerElapsed = time.time() - sharedStartTime.value
+		fps = done / workerElapsed if workerElapsed > 0 else 0
+		print(
+			f"[Slot {slotId:02d}] frame {frameNum:06d}  {elapsed:.1f}s",
+			flush=True,
+		)
 
-		if result.returncode != 0:
-			print(
-				f"[Worker {workerId:03d}] ERROR on frame {frameNum}: "
-				f"subprocess exited with code {result.returncode}",
-				flush=True,
-			)
-
-		completed = i + 1
-		remaining = len(myFrames) - completed
-		pct = 100 * completed / len(myFrames)
-
-		workerElapsed = time.time() - sharedStartTimes.value
-		fpsK = completed / workerElapsed if workerElapsed > 0 else 0
-		etaK = fmt_duration(remaining / fpsK) if fpsK > 0 else "??:??:??"
-
-	print(f"[Worker {workerId:03d}] Done.", flush=True)
+	print(f"[Slot {slotId:02d}] Batch complete, exiting.", flush=True)
 
 # ------------------------------------------- #
 
-def progress_monitor(sharedDone, sharedTotal, sharedStartTimes, numWorkers, log_interval):
+def progress_monitor(sharedDone, totalFrames, sharedStartTime, log_interval):
 	time.sleep(2)
-	
+
 	while True:
-		now = time.time()
-		elapsed = now - sharedStartTimes.value
+		elapsed = time.time() - sharedStartTime.value
+		done = sharedDone[0]
+		remaining = totalFrames - done
+		pct = 100 * done / totalFrames if totalFrames > 0 else 0
 
-		totalDone   = sum(sharedDone[k]  for k in range(numWorkers))
-		totalFrames = sum(sharedTotal[k] for k in range(numWorkers))
-		remaining    = totalFrames - totalDone
-		pct          = 100 * totalDone / totalFrames if totalFrames > 0 else 0
-
-		if elapsed > 0 and totalDone > 0:
-			fpsAll = totalDone / elapsed
-			etaAll = fmt_duration(remaining / fpsAll)
-			fpsStr = f"{fpsAll:.2f} fr/s"
+		if elapsed > 0 and done > 0:
+			fps = done / elapsed
+			eta = fmt_duration(remaining / fps)
+			fpsStr = f"{fps:.2f} fr/s"
 		else:
-			etaAll = "??:??:??"
+			eta = "??:??:??"
 			fpsStr = "—"
 
 		sep = "─" * 72
-		lines = [
-			"",
-			sep,
-			f"  ▶ OVERALL  {totalDone}/{totalFrames} frames  ({pct:.1f}%)  "
-			f"elapsed={fmt_duration(elapsed)}  ETA={etaAll}  throughput={fpsStr}",
-			f"  {'Worker':<8} {'Done':>6} {'Total':>6} {'%':>6}  {'Worker ETA':>12}",
-			f"  {'------':<8} {'----':>6} {'-----':>6} {'---':>6}  {'----------':>12}",
-		]
+		print(
+			f"\n{sep}\n"
+			f"  ▶ OVERALL  {done}/{totalFrames} frames  ({pct:.1f}%)  "
+			f"elapsed={fmt_duration(elapsed)}  ETA={eta}  throughput={fpsStr}"
+			f"\n{sep}",
+			flush=True,
+		)
 
-		for k in range(numWorkers):
-			doneK  = sharedDone[k]
-			totalK = sharedTotal[k]
-			pctK   = 100 * doneK / totalK if totalK > 0 else 0
-			remK   = totalK - doneK
-
-			if elapsed > 0 and doneK > 0:
-				fpsK = doneK / elapsed
-				etaK = fmt_duration(remK / fpsK) if fpsK > 0 else "??:??:??"
-			else:
-				etaK = "??:??:??"
-
-			status = "✓ done" if doneK >= totalK > 0 else etaK
-			lines.append(
-				f"  {k:<8} {doneK:>6} {totalK:>6} {pctK:>5.1f}%  {status:>12}"
-			)
-
-		lines.append(sep)
-		print("\n".join(lines), flush=True)
-
-		if totalDone >= totalFrames > 0:
+		if done >= totalFrames > 0:
 			break
 
 		time.sleep(log_interval)
@@ -186,32 +128,63 @@ def progress_monitor(sharedDone, sharedTotal, sharedStartTimes, numWorkers, log_
 # ------------------------------------------- #
 
 def main():
-
-	# setup argparse:
-	# ---------------
 	parser = argparse.ArgumentParser(description="Parallel mlsharp_to_spatial_photo runner")
-	parser.add_argument("--frames-dir", required=True, help="Directory containing frame PNGs")
-	parser.add_argument("--plys-dir",   required=True, help="Directory containing PLY files")
-	parser.add_argument("--num-processes", "-n", type=int, required=True,
-						help="Total number of worker processes (N)")
-	parser.add_argument("--num-gpus", "-g", type=int, required=True,
-						help="Number of GPUs (M)")
-	parser.add_argument("--base-display", type=int, default=100,
-						help="Starting Xvfb display number (default: 100). "
-							 "Workers use :base, :base+1, ..., :base+N-1.")
-	parser.add_argument("--out-dir", required=True,
-						help="Output directory. Subfolders ipd_064, ipd_032, etc. will be created inside.")
+	parser.add_argument("--frames-dir",    required=True)
+	parser.add_argument("--plys-dir",      required=True)
+	parser.add_argument("--out-dir",       required=True)
+	parser.add_argument("--num-slots", "-n", type=int, required=True,
+						help="Number of concurrent worker processes")
+	parser.add_argument("--num-gpus",  "-g", type=int, required=True,
+						help="Number of GPUs")
+	parser.add_argument("--frames-per-worker", "-k", type=int, default=10,
+						help="Max frames each worker processes before exiting and being replaced (default: 10)")
+	parser.add_argument("--base-display", type=int, default=100)
 	parser.add_argument("--stereo-ipds", nargs="+", type=float,
-						default=[0.064, 0.032, 0.016, 0.008],
-						help="IPD values for stereo output images (meters)")
-	parser.add_argument("--log-interval", type=float, default=30.0,
-						help="Seconds between progress summary logs (default: 30)")
+						default=[0.064, 0.032, 0.016, 0.008])
+	parser.add_argument("--log-interval", type=float, default=30.0)
 	args = parser.parse_args()
 
-	N = args.num_processes
+	N = args.num_slots
 	M = args.num_gpus
+	K = args.frames_per_worker
 
-	print(f"Spawning {N} workers across {M} GPUs (~{N/M:.1f} workers per GPU)")
+	# collect and sort all frames:
+	# ---------------
+	allFramePaths = sorted(
+		glob.glob(os.path.join(args.frames_dir, "*.png")),
+		key=get_frame_number,
+	)
+
+	# build (framePath, plyPath, outStereoImages) tuples, skip missing plys:
+	# ---------------
+	allTasks = []
+	for framePath in allFramePaths:
+		frameNum  = get_frame_number(framePath)
+		frameStem = os.path.splitext(os.path.basename(framePath))[0]
+		plyPath   = os.path.join(args.plys_dir, f"{frameStem}.ply")
+
+		if not os.path.exists(plyPath):
+			print(f"WARNING: PLY not found for {framePath}, skipping.")
+			continue
+
+		outStereoImages = [
+			(ipd, os.path.join(args.out_dir, f"ipd_{int(ipd * 1000):03d}", f"frame_{frameNum:06d}.png"))
+			for ipd in args.stereo_ipds
+		]
+
+		if all(os.path.exists(path) for _, path in outStereoImages):
+			continue
+
+		allTasks.append((framePath, plyPath, outStereoImages))
+
+	totalFrames = len(allTasks)
+
+	# split tasks into groups of K:
+	# ---------------
+	groups = [allTasks[i:i + K] for i in range(0, totalFrames, K)]
+	numGroups = len(groups)
+
+	print(f"Total frames: {totalFrames}  |  Groups of {K}: {numGroups}  |  Slots: {N}  |  GPUs: {M}")
 	print(f"Progress summary every {args.log_interval:.0f}s\n")
 
 	# create output folders:
@@ -221,82 +194,126 @@ def main():
 		os.makedirs(folder, exist_ok=True)
 		print(f"  Output folder: {folder}")
 
-	# create shared memory:
+	# start xvfb for each slot:
 	# ---------------
-	sharedDone       = Array(c_int,    [0] * N)
-	sharedTotal      = Array(c_int,    [0] * N)
-	sharedStartTimes = Value(c_double, 0.0)
+	xvfbProcs = []
+	for slotId in range(N):
+		disp = args.base_display + slotId
+		print(f"  Starting Xvfb :{disp} for slot {slotId} ...")
+		xvfbProcs.append(start_xvfb(disp))
 
-	# start xvfb for each process:
+	# shared state:
 	# ---------------
-	xvfb_procs = []
-	for k in range(N):
-		disp = args.base_display + k
-		print(f"  Starting Xvfb :{disp} for worker {k} ...")
-		xvfb_procs.append(start_xvfb(disp))
+	sharedDone      = Array(c_int,    [0])
+	sharedStartTime = Value(c_double, 0.0)
+	nextGroup       = Value(c_int,    0)
+	nextGroupLock   = Lock()
 
-	# start each worker:
+	def claim_next_group():
+		"""Returns the next group index to process, or None if all done."""
+		with nextGroupLock:
+			idx = nextGroup.value
+			if idx >= numGroups:
+				return None, None
+			nextGroup.value += 1
+		return idx, groups[idx]
+
+	# graceful shutdown:
 	# ---------------
-	sharedStartTimes.value = time.time()
+	activeWorkers = {}   # slotId -> Process
+	shutdown_event = threading.Event()
 
-	workers = []
-	for k in range(N):
-		gpuId     = k % M
-		displayId = args.base_display + k
-		p = Process(
-			target=worker,
-			args=(
-				k, N, gpuId, displayId,
-				args.frames_dir, args.plys_dir, args.stereo_ipds,
-				args.out_dir,
-				sharedDone, sharedTotal, sharedStartTimes,
-			),
-			daemon=True,
-		)
+	def shutdown(sig, frame):
+		print("\nInterrupted — terminating all workers and Xvfb instances...")
+		shutdown_event.set()
+		for p in activeWorkers.values():
+			p.terminate()
+		for x in xvfbProcs:
+			x.terminate()
+		sys.exit(1)
 
-		p.start()
-		workers.append(p)
-		print(f"  Worker {k:03d} started  PID={p.pid}  GPU={gpuId}  DISPLAY=:{displayId}.0")
-
-	print()
+	signal.signal(signal.SIGINT,  shutdown)
+	signal.signal(signal.SIGTERM, shutdown)
 
 	# start progress monitor:
 	# ---------------
+	sharedStartTime.value = time.time()
+
 	monitor = threading.Thread(
 		target=progress_monitor,
-		args=(sharedDone, sharedTotal, sharedStartTimes, N, args.log_interval),
+		args=(sharedDone, totalFrames, sharedStartTime, args.log_interval),
 		daemon=True,
 	)
 	monitor.start()
 
-	# graceful shutdown:
+	# seed all slots with their first group:
 	# ---------------
-	def shutdown(sig, frame):
-		print("\nInterrupted — terminating workers and Xvfb instances...")
-		for p in workers:
-			p.terminate()
-		for x in xvfb_procs:
-			x.terminate()
-		sys.exit(1)
+	def spawn_worker(slotId):
+		groupIdx, batch = claim_next_group()
+		if batch is None:
+			return False
 
-	signal.signal(signal.SIGINT, shutdown)
-	signal.signal(signal.SIGTERM, shutdown)
+		gpuId     = slotId % M
+		displayId = args.base_display + slotId
 
-	# join with each worker, cleanup:
+		p = Process(
+			target=worker,
+			args=(
+				slotId, gpuId, displayId,
+				batch,
+				args.frames_dir, args.plys_dir, args.stereo_ipds, args.out_dir,
+				sharedDone, sharedStartTime,
+			),
+			daemon=True,
+		)
+		p.start()
+		activeWorkers[slotId] = p
+		print(
+			f"  → Slot {slotId:02d}  PID={p.pid}  GPU={gpuId}  group {groupIdx}/{numGroups - 1}  "
+			f"({len(batch)} frames)",
+			flush=True,
+		)
+		return True
+
+	for slotId in range(N):
+		spawn_worker(slotId)
+
+	print()
+
+	# main loop: replace workers as they finish:
 	# ---------------
-	for p in workers:
-		p.join()
+	while not shutdown_event.is_set():
+		allDone = True
 
-	for x in xvfb_procs:
-		x.terminate()
+		for slotId in list(activeWorkers.keys()):
+			p = activeWorkers[slotId]
+
+			if p.is_alive():
+				allDone = False
+				continue
+
+			p.join()
+			del activeWorkers[slotId]
+
+			if not spawn_worker(slotId):
+				pass
+			else:
+				allDone = False
+
+		# check if everything is truly finished
+		if not activeWorkers and nextGroup.value >= numGroups:
+			break
+
+		time.sleep(1)
 
 	# final summary:
 	# ---------------
-	totalDone   = sum(sharedDone[k]  for k in range(N))
-	totalFrames = sum(sharedTotal[k] for k in range(N))
-	elapsed     = time.time() - sharedStartTimes.value
+	elapsed = time.time() - sharedStartTime.value
+	done    = sharedDone[0]
+	print(f"\n✓ All done.  {done}/{totalFrames} frames in {fmt_duration(elapsed)}.")
 
-	print(f"\n✓ All workers finished.  {totalDone}/{totalFrames} frames in {fmt_duration(elapsed)}.")
+	for x in xvfbProcs:
+		x.terminate()
 
 
 if __name__ == "__main__":
