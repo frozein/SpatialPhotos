@@ -717,7 +717,7 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
 				stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
 				stereo.paste(imgLeft, (0, 0))
 				stereo.paste(imgRight, (orgWidth, 0))
-				stereo.save(path)
+				stereo.save(path, compress_level=1)
 		finally:
 			renderer.release_scene(scene)
 
@@ -779,6 +779,8 @@ if __name__ == "__main__":
 		orgImagePath="insidious/clip2/frames/frame_044.png",
 		plyPath     ="insidious/clip2/plys/frame_044.ply",
 		outGLB      =None,#"insidious/clip2/glbs/frame_044.glb",
-		outStereoImages=[(0.064, "test.png")],
+		outStereoImages=[
+			(0.064, "test_064.png")
+		],
 	)
 	main()

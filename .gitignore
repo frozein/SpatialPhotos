@@ -1,0 +1,9 @@
+# testing data
+*.mp4
+*.mkv
+*.png
+*.ply
+*.glb
+
+# pycache
+**/__pycache__/
