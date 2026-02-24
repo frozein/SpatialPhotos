@@ -267,56 +267,6 @@ def generate_block_atlas(slices, blockSize):
 
 	return atlas, placements
 
-
-# ------------------------------------------- #
-# Depth infill — fully on CUDA
-# ------------------------------------------- #
-
-def fill_block_depth_cuda(depth_block: torch.Tensor) -> torch.Tensor:
-	"""
-	depth_block: (blockSize, blockSize) float32 CUDA tensor
-	Returns filled tensor, same shape and device.
-	"""
-	valid = depth_block > 0
-	if not valid.any():
-		return depth_block
-
-	ys, xs = torch.where(valid)
-	zs = depth_block[ys, xs]
-
-	mean = zs.mean()
-	std = zs.std() if zs.shape[0] >= 2 else torch.tensor(0.0, device=zs.device)
-	inlier = (zs - mean).abs() <= DEPTH_INFILL_OUTLIER_STD * std
-
-	if not inlier.any():
-		filled = depth_block.clone()
-		filled[~valid] = mean
-		return filled
-
-	xs_in = xs[inlier].float()
-	ys_in = ys[inlier].float()
-	zs_in = zs[inlier]
-
-	# Plane fit via least squares on CUDA
-	A = torch.stack([xs_in, ys_in, torch.ones_like(xs_in)], dim=1)  # (N, 3)
-	sol = torch.linalg.lstsq(A, zs_in.unsqueeze(1)).solution         # (3, 1)
-	a, b, c = sol[0, 0], sol[1, 0], sol[2, 0]
-
-	H, W = depth_block.shape
-	yy = torch.arange(H, device=depth_block.device, dtype=torch.float32)
-	xx = torch.arange(W, device=depth_block.device, dtype=torch.float32)
-	yy, xx = torch.meshgrid(yy, xx, indexing='ij')
-	z_est = a * xx + b * yy + c
-
-	filled = depth_block.clone()
-	invalid = ~valid
-	if valid.float().mean() < DEPTH_INFILL_CUTOFF:
-		filled[invalid] = mean
-	else:
-		filled[invalid] = z_est[invalid]
-
-	return filled
-
 def fill_block_depths(placements, slices, blockSize):
 
 	B = blockSize
@@ -723,65 +673,15 @@ def mlsharp_to_spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
 
 # ------------------------------------------- #
 
-import re
-import argparse
-from pathlib import Path
-
-def main():
-	parser = argparse.ArgumentParser(description="Batch process frame_N.png and frame_N.ply pairs.")
-	parser.add_argument("--image_dir", required=True)
-	parser.add_argument("--ply_dir",   required=True)
-	parser.add_argument("--out_glb_dir", default=None)
-	parser.add_argument("--out_png_dir", default=None)
-	args = parser.parse_args()
-
-	image_dir   = Path(args.image_dir)
-	ply_dir     = Path(args.ply_dir)
-	out_glb_dir = Path(args.out_glb_dir) if args.out_glb_dir else None
-	out_png_dir = Path(args.out_png_dir) if args.out_png_dir else None
-
-	if out_glb_dir: out_glb_dir.mkdir(parents=True, exist_ok=True)
-	if out_png_dir: out_png_dir.mkdir(parents=True, exist_ok=True)
-
-	pattern    = re.compile(r"frame_?(\d+)\.png$")
-	image_files = sorted(image_dir.glob("*.png"))
-	pairs = []
-
-	for img_path in image_files:
-		match = pattern.search(img_path.name)
-		if not match:
-			continue
-		idx = match.group(1)
-		ply_path = ply_dir / f"frame_{idx}.ply"
-		if not ply_path.exists():
-			ply_path = ply_dir / f"frame{idx}.ply"
-		if ply_path.exists():
-			pairs.append((idx, img_path, ply_path))
-
-	total = len(pairs)
-	print(f"Found {total} matching frame pairs\n")
-
-	for i, (idx, img_path, ply_path) in enumerate(pairs, 1):
-		out_glb = out_glb_dir / f"frame_{idx}.glb" if out_glb_dir else None
-		out_png = out_png_dir / f"frame_{idx}.png" if out_png_dir else None
-
-		mlsharp_to_spatial_photo(
-			orgImagePath=str(img_path),
-			plyPath=str(ply_path),
-			outGLB=str(out_glb)  if out_glb else None,
-			outStereoImage=str(out_png) if out_png else None
-		)
-		print(f"FINISHED {i}/{total} (frame_{idx})\n")
-
-
 if __name__ == "__main__":
-	mlsharp_to_spatial_photo(
-		orgImagePath="insidious/clip2/frames/frame_044.png",
-		plyPath     ="insidious/clip2/plys/frame_044.ply",
-		outGLB      =None,#"insidious/clip2/glbs/frame_044.glb",
-		outStereoImages=[
-			(0.064, "test_064.png")
-		],
-	)
-	
-	main()
+	for i in range(1, 74):
+		mlsharp_to_spatial_photo(
+			orgImagePath=f"insidious/clip2/frames/frame_{i:03d}.png",
+			plyPath     =f"insidious/clip2/plys/frame_{i:03d}.ply",
+			outGLB      =None,#"insidious/clip2/glbs/frame_044.glb",
+			outStereoImages=[
+				(0.064, f"insidious/clip2/stereo/frame_{i:03d}.png")
+			],
+		)
+
+		print(f"FINISHED FRAME {i}")
