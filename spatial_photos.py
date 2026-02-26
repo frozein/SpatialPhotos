@@ -40,7 +40,7 @@ MOTION_THRESHOLD = 10.0
 MOTION_THUMB_SIZE = (128, 72)
 TEMPORAL_WINDOW = 0
 
-BLEED_K = -1
+BLEED_K = 3
 BLEED_COLOR_TOLERANCE = 20
 
 # ------------------------------------------- #
@@ -256,7 +256,7 @@ def pack_blocks(mergedBlockDims):
 	return finalPacker
 
 
-def generate_block_atlas(slicesGeom, slicesRender=None):
+def generate_block_atlas(slicesGeom, slicesRender=None, gtMasks=None):
 	mergedMeta = []
 	mergedDims = []
 
@@ -298,6 +298,13 @@ def generate_block_atlas(slicesGeom, slicesRender=None):
 
 	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
 
+	# Build a B&W mask atlas if gtMasks provided:
+	# black = GT pixel, white = non-GT pixel, alpha matches color atlas
+	# ---------------
+	maskAtlas = None
+	if gtMasks is not None:
+		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
+
 	placements = []
 
 	for rect in packer.rect_list():
@@ -308,6 +315,14 @@ def generate_block_atlas(slicesGeom, slicesRender=None):
 
 		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
 		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
+
+		if maskAtlas is not None:
+			gtPatch = gtMasks[sliceIdx, srcPy:srcPy+ph, srcPx:srcPx+pw]
+
+			maskAtlas[ay:ay+ah, ax:ax+aw, :3] = torch.where(
+				gtPatch.unsqueeze(-1), 0, 255
+			)
+			maskAtlas[ay:ay+ah, ax:ax+aw, 3] = srcPatch[..., 3]
 
 		for (gx, gy) in blockCoords:
 			bx = gx * BLOCK_SIZE
@@ -329,7 +344,11 @@ def generate_block_atlas(slicesGeom, slicesRender=None):
 	atlas[transparent] = 0
 	atlas[..., 3][~transparent] = 255
 
-	return atlas, placements
+	if maskAtlas is not None:
+		maskAtlas[transparent] = 0
+		maskAtlas[..., 3][~transparent] = 255
+
+	return atlas, placements, maskAtlas
 
 def fill_block_depths(placements, slices):
 
@@ -775,7 +794,16 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 
 		# generate block atlas
 		originalSlices = slicesCache[centerPos]
-		atlas, placements = generate_block_atlas(originalSlices, smoothedSlices)
+		gtMasks = gtMaskCache[centerPos]
+
+		outStereoImages = outStereoImagesFn(fi) if outStereoImagesFn else None
+		needsMaskAtlas = outStereoImages is not None and any(maskPath is not None for (_, _, maskPath) in outStereoImages)
+
+		atlas, placements, maskAtlas = generate_block_atlas(
+			originalSlices,
+			smoothedSlices,
+			gtMasks=gtMasks if needsMaskAtlas else None
+		)
 
 		# build geometry
 		proj = projMatrixCache[centerPos]
@@ -788,6 +816,7 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 		)
 
 		atlasCpu     = atlas.cpu().numpy()
+		maskAtlasCpu = maskAtlas.cpu().numpy() if maskAtlas is not None else None
 		positionsCpu = positions.cpu().numpy()
 		uvsCpu       = uvs.cpu().numpy()
 		indicesCpu   = indices.cpu().numpy()
@@ -799,13 +828,18 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 			exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
 
 		# render stereo images
-		outStereoImages = outStereoImagesFn(fi) if outStereoImagesFn else None
 		if outStereoImages is not None:
 			up = torch.tensor([0.0, 1.0, 0.0])
 			scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight))
 
+			maskScene = None
+			if maskAtlasCpu is not None:
+				maskScene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, maskAtlasCpu, (orgWidth, orgHeight))
+
 			try:
-				for (ipd, path) in outStereoImages:
+				for entry in outStereoImages:
+					ipd, path, maskPath = entry
+
 					print(f'Saving stereo render: {path}...')
 
 					eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
@@ -823,8 +857,26 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 					stereo.paste(imgLeft,  (0, 0))
 					stereo.paste(imgRight, (orgWidth, 0))
 					stereo.save(path, compress_level=1)
+
+					# optionally save mask stereo image
+					if maskPath is not None and maskScene is not None:
+						print(f'Saving stereo mask: {maskPath}...')
+
+						maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  proj.cpu().numpy())
+						maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), proj.cpu().numpy())
+
+						maskLeft  = maskLeft.convert('L')
+						maskRight = maskRight.convert('L')
+
+						stereoMask = Image.new('L', (orgWidth * 2, orgHeight))
+						stereoMask.paste(maskLeft,  (0, 0))
+						stereoMask.paste(maskRight, (orgWidth, 0))
+						stereoMask.save(maskPath, compress_level=1)
+
 			finally:
 				renderer.release_scene(scene)
+				if maskScene is not None:
+					renderer.release_scene(maskScene)
 
 		evict_old_frames(centerPos)
 
@@ -845,5 +897,5 @@ if __name__ == "__main__":
 	    orgImagePathFn =lambda i: f"insidious/clip1/frames/frame_{i:03d}.png",
 	    plyPathFn      =lambda i: f"insidious/clip1/plys/frame_{i:03d}.ply",
 	    outGLBFn       =None,#lambda i: f"insidious/clip2/glbs/frame_{i:03d}.glb",
-	    outStereoImagesFn=lambda i: [(0.064, f"insidious/clip1/stereo/frame_{i:03d}.png")]
+	    outStereoImagesFn=lambda i: [(0.064, f"insidious/clip1/stereo/frame_{i:03d}.png", f"insidious/clip1/stereo_mask/frame_{i:03d}.png")]
 	)
