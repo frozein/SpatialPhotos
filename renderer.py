@@ -6,7 +6,8 @@ from PIL import Image
 # ------------------------------------------- #
 
 ctx = moderngl.create_context(standalone=True)
-ctx.enable(moderngl.DEPTH_TEST)
+ctx.enable(moderngl.BLEND)
+ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
 prog = ctx.program(
 	vertex_shader='''
@@ -27,9 +28,8 @@ prog = ctx.program(
 		in vec2 v_text;
 		out vec4 f_color;
 		void main() {
-			f_color = texture(Texture, v_text);
-			if(f_color.a < 1.0)
-				discard;
+			vec4 c = texture(Texture, v_text);
+			f_color = vec4(c.rgb * c.a, c.a);
 		}
 	''',
 )
@@ -80,7 +80,7 @@ def render_view(scene, view, proj):
 	prog['m_proj'].write(proj.tobytes())
 
 	scene['fbo'].use()
-	scene['fbo'].clear(0.0, 0.0, 0.0, 1.0)
+	scene['fbo'].clear(1.0, 0.0, 0.0, 1.0)
 	
 	scene['vao'].render(moderngl.TRIANGLES)
 

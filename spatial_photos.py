@@ -25,7 +25,7 @@ NUM_SLICES = 30
 
 BLOCK_SIZE = 64
 
-ALPHA_REPLACE_THRESHOLD = 0.1
+ALPHA_REPLACE_THRESHOLD = 25
 ALPHA_TEST_THRESHOLD = 128
 
 DEPTH_INFILL_CUTOFF = 0.1
@@ -38,10 +38,13 @@ UV_PADDING = 0.0
 
 MOTION_THRESHOLD = 10.0
 MOTION_THUMB_SIZE = (128, 72)
-TEMPORAL_WINDOW = 0
+TEMPORAL_WINDOW = 2
 
 BLEED_K = 3
 BLEED_COLOR_TOLERANCE = 20
+
+DEPTH_SMOOTH_ALPHA = 0.3
+DEPTH_CROSS_SLICE_REL_TOLERANCE = 0.05
 
 # ------------------------------------------- #
 
@@ -158,7 +161,7 @@ def temporal_smooth_slices(frameWindow, centerIdx, gtMasks):
 			rgba  = src
 			alpha = src[..., 3]
 
-			found = alpha > 128
+			found = alpha > ALPHA_TEST_THRESHOLD
 			bestRgba = rgba.clone()
 
 			accRgba[found]  += bestRgba[found]
@@ -168,7 +171,7 @@ def temporal_smooth_slices(frameWindow, centerIdx, gtMasks):
 		smoothedRgba = torch.zeros((H, W, 4), dtype=torch.float32, device='cuda')
 		smoothedRgba[hasData] = accRgba[hasData] / accCount[hasData].unsqueeze(-1)
 
-		applyMask = (~centerGtMask) & (centerImg[..., 3] > 128) & hasData
+		applyMask = (~centerGtMask) & (centerImg[..., 3] > ALPHA_TEST_THRESHOLD) & hasData
 
 		ys, xs = applyMask.nonzero(as_tuple=True)
 		centerImg[ys, xs, 0] = smoothedRgba[ys, xs, 0].to(torch.uint8)
@@ -298,9 +301,6 @@ def generate_block_atlas(slicesGeom, slicesRender=None, gtMasks=None):
 
 	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
 
-	# Build a B&W mask atlas if gtMasks provided:
-	# black = GT pixel, white = non-GT pixel, alpha matches color atlas
-	# ---------------
 	maskAtlas = None
 	if gtMasks is not None:
 		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
@@ -322,7 +322,6 @@ def generate_block_atlas(slicesGeom, slicesRender=None, gtMasks=None):
 			maskAtlas[ay:ay+ah, ax:ax+aw, :3] = torch.where(
 				gtPatch.unsqueeze(-1), 0, 255
 			)
-			maskAtlas[ay:ay+ah, ax:ax+aw, 3] = srcPatch[..., 3]
 
 		for (gx, gy) in blockCoords:
 			bx = gx * BLOCK_SIZE
@@ -338,15 +337,8 @@ def generate_block_atlas(slicesGeom, slicesRender=None, gtMasks=None):
 
 			placements.append((sliceIdx, bx, by, u0, v1, u1, v0))
 
-	alpha = atlas[..., 3]
-	transparent = alpha < ALPHA_TEST_THRESHOLD
-
-	atlas[transparent] = 0
-	atlas[..., 3][~transparent] = 255
-
 	if maskAtlas is not None:
-		maskAtlas[transparent] = 0
-		maskAtlas[..., 3][~transparent] = 255
+		maskAtlas[..., 3] = atlas[..., 3]
 
 	return atlas, placements, maskAtlas
 
@@ -501,6 +493,90 @@ def build_geometry(placements, slices, width, height, focal, aspect):
 
 	zGrid, _ = zGrid.cummax(dim=0)
 
+	return zGrid, GW, GH
+
+def apply_depth_smoothing(zGrid, depthHistory, motionGated):
+
+	S, GHp1, GWp1 = zGrid.shape
+	hasDepth = zGrid > 0.0
+
+	# initialize on first frame:
+	# ---------------
+	if 'ema' not in depthHistory:
+		depthHistory['ema']   = zGrid.clone()
+		depthHistory['valid'] = hasDepth.clone()
+
+		return zGrid
+
+	ema   = depthHistory['ema']
+	valid = depthHistory['valid']
+
+	# early exit if scene has high motion:
+	# ---------------
+	if motionGated:
+		smoothed = torch.where(valid & hasDepth, ema, zGrid)
+		return smoothed
+
+	# fill any region without history:
+	# ---------------
+	noHistory = hasDepth & ~valid
+	if noHistory.any():
+		for dSlice in [1, -1]:
+			if dSlice == 1:
+				neighbValid = torch.cat([valid[1:],  valid[-1:].new_zeros((1, GHp1, GWp1))],  dim=0)
+				neighbEma   = torch.cat([ema[1:],    ema[-1:].new_zeros((1, GHp1, GWp1))],    dim=0)
+			else:
+				neighbValid = torch.cat([valid[:1].new_zeros((1, GHp1, GWp1)), valid[:-1]],   dim=0)
+				neighbEma   = torch.cat([ema[:1].new_zeros((1, GHp1, GWp1)),   ema[:-1]],     dim=0)
+
+			depthClose = (
+				(neighbEma - zGrid).abs() <
+				DEPTH_CROSS_SLICE_REL_TOLERANCE * zGrid.clamp(min=1e-6)
+			)
+
+			canInherit = noHistory & neighbValid & depthClose
+
+			ema   = torch.where(canInherit, neighbEma, ema)
+			valid = valid | canInherit
+
+			noHistory = noHistory & ~canInherit
+
+	# apply smoothing:
+	# ---------------
+	alpha = DEPTH_SMOOTH_ALPHA
+
+	hasHistory = valid & hasDepth
+	newEma = torch.where(
+		hasHistory,
+		alpha * zGrid + (1.0 - alpha) * ema,
+		ema
+	)
+
+	newEma = torch.where(noHistory, zGrid, newEma)
+	newValid = valid | hasDepth
+
+	depthHistory['ema']   = newEma
+	depthHistory['valid'] = newValid
+
+	smoothed = torch.where(newValid & hasDepth, newEma, zGrid)
+	return smoothed
+
+
+def finish_geometry(smoothedZGrid, placements, width, height, focal, aspect):
+	"""
+	Given an already-smoothed zGrid, complete the geometry build:
+	enforce monotonicity then compute world-space positions and UVs.
+	"""
+	placements = sorted(placements, key=lambda x: x[0], reverse=True)
+	N = len(placements)
+
+	S  = NUM_SLICES
+	GW = width  // BLOCK_SIZE
+	GH = height // BLOCK_SIZE
+
+	# enforce monotonicity across slices
+	zGrid, _ = smoothedZGrid.cummax(dim=0)
+
 	# compute worldspace vertex coordinates:
 	# ---------------
 	print("Computing vertex coordinates...")
@@ -516,7 +592,6 @@ def build_geometry(placements, slices, width, height, focal, aspect):
 
 	xWorld = xOffset * zGrid / focal
 	yWorld = yOffset * zGrid / focal
-	# zWorld is zGrid
 
 	# compute positions and uvs:
 	# ---------------
@@ -572,7 +647,7 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 		for i in range(len(slices))
 	], dim=0)
 
-	hitMask  = alphaStack > int(ALPHA_REPLACE_THRESHOLD * 255)
+	hitMask  = alphaStack > ALPHA_REPLACE_THRESHOLD
 	hitAny   = hitMask.any(dim=0)
 	firstHit = hitMask.to(torch.int32).argmax(dim=0)
 
@@ -633,7 +708,6 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 			bOrgX = bx - offX
 			bOrgY = by - offY
 
-			slices[s + 1][0][by, bx, :3] = orgRGB[bOrgY, bOrgX]
 			gtMask[s + 1, by, bx] = True
 
 	return slices, gtMask
@@ -668,6 +742,7 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 	gtMaskCache     = {}
 	projMatrixCache = {}
 	settingsCache   = {}
+	depthHistory = {}
 
 	def load_frame(pos):
 		if pos in slicesCache:
@@ -765,6 +840,7 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 		windowSlices  = []
 		windowGtMasks = []
 		excluded = 0
+		highMotion = False
 		for pos in range(windowStart, windowEnd + 1):
 			if pos == centerPos:
 				windowSlices.append(slicesCache[pos])
@@ -776,6 +852,7 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 					windowGtMasks.append(gtMaskCache[pos])
 				else:
 					excluded += 1
+					highMotion = True
 					print(f'Excluding frame pos={pos} from temporal smoothing (score={score:.1f} > threshold={MOTION_THRESHOLD})')
 
 		centerInWindow = sum(
@@ -783,8 +860,8 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 			if compute_motion_score(centerImg, orgImageCache[pos]) <= MOTION_THRESHOLD
 		)
 
-		# temporal smoothing
-		print(f'Applying temporal smoothing...')
+		# temporal smoothing (color)
+		print(f'Applying temporal color smoothing...')
 
 		smoothedSlices = temporal_smooth_slices(
 			frameWindow=windowSlices,
@@ -805,14 +882,27 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 			gtMasks=gtMasks if needsMaskAtlas else None
 		)
 
-		# build geometry
+		# build geometry (returns raw zGrid before smoothing)
 		proj = projMatrixCache[centerPos]
+		focal = float(proj[1, 1].item() * outfilledHeight / 2)
 
-		positions, uvs, indices = build_geometry(
+		print("Building raw depth grid...")
+		zGrid, GW, GH = build_geometry(
 			placements, originalSlices,
 			outfilledWidth, outfilledHeight,
-			float(proj[1, 1].item() * outfilledHeight / 2),
-			aspect
+			focal, aspect
+		)
+
+		# temporal smoothing (depth)
+		print("Applying temporal depth smoothing...")
+
+		smoothedZGrid = apply_depth_smoothing(zGrid, depthHistory, motionGated=highMotion)
+
+		# finish geometry from smoothed zGrid
+		positions, uvs, indices = finish_geometry(
+			smoothedZGrid, placements,
+			outfilledWidth, outfilledHeight,
+			focal, aspect
 		)
 
 		atlasCpu     = atlas.cpu().numpy()
@@ -1013,6 +1103,6 @@ if __name__ == "__main__":
 		spatial_photo(
 			orgImagePath    = inputPath,
 			plyPath         = plyPath,
-			outGLB          = outGLB,
+			outGLB          = args.out_glb,
 			outStereoImages = [single_stereo_entry(ipdMM) for ipdMM in args.ipd],
 		)
