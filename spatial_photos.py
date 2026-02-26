@@ -920,7 +920,7 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 		# render stereo images
 		if outStereoImages is not None:
 			up = torch.tensor([0.0, 1.0, 0.0])
-			scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight))
+			scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight), centerImg)
 
 			maskScene = None
 			if maskAtlasCpu is not None:
