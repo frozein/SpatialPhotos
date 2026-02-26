@@ -915,7 +915,8 @@ if __name__ == "__main__":
 	parser.add_argument("--out-glb",    type=str, default=None, help="Output GLB path or directory (sequence mode writes per-frame GLBs here).")
 	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo image path or directory.")
 	parser.add_argument("--out-mask",   type=str, default=None, help="Output stereo mask image path or directory (requires --out-stereo).")
-	parser.add_argument("--ipd",        type=float, default=0.064, help="Interpupillary distance in metres for stereo render (default: 0.064).")
+	parser.add_argument("--ipd", type=int, nargs="+", default=[64], metavar="MM",
+		help="One or more interpupillary distances in millimetres (default: 64). Each IPD is rendered into its own ipd_NNN subdirectory.")
 
 	args = parser.parse_args()
 
@@ -971,11 +972,14 @@ if __name__ == "__main__":
 			orgImagePathFn   = lambda i: os.path.join(framesDir, f"{prefix}{i:0{digits}d}{frame_ext(i)}"),
 			plyPathFn        = lambda i: os.path.join(plysDir,   f"{prefix}{i:0{digits}d}.ply"),
 			outGLBFn         = (lambda i: out_path(args.out_glb,    i, digits, prefix, ".glb")) if args.out_glb    else None,
-			outStereoImagesFn= (lambda i: [(
-				args.ipd,
-				out_path(args.out_stereo, i, digits, prefix, ".png"),
-				out_path(args.out_mask,   i, digits, prefix, ".png") if args.out_mask else None,
-			)]) if args.out_stereo else None,
+			outStereoImagesFn= (lambda i: [
+				(
+					ipdMM / 1000.0,
+					out_path(os.path.join(args.out_stereo, f"ipd_{ipdMM:03d}"), i, digits, prefix, ".png"),
+					out_path(os.path.join(args.out_mask,   f"ipd_{ipdMM:03d}"), i, digits, prefix, ".png") if args.out_mask else None,
+				)
+				for ipdMM in args.ipd
+			]) if args.out_stereo else None,
 		)
 
 	# single file mode:
@@ -990,13 +994,25 @@ if __name__ == "__main__":
 		if not os.path.isfile(plyPath):
 			parser.error(f"PLY file not found: '{plyPath}'. Use --ply to specify its path.")
 
-		outGLB    = args.out_glb    if args.out_glb    else base + ".glb"
-		outStereo = args.out_stereo if args.out_stereo else base + "_stereo.png"
-		outMask   = args.out_mask   if args.out_mask   else None
+		stereoBase = args.out_stereo if args.out_stereo else os.path.splitext(inputPath)[0] + "_stereo"
+		maskBase   = args.out_mask   if args.out_mask   else None
+
+		def single_stereo_entry(ipdMM):
+			stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
+			os.makedirs(stereoDir, exist_ok=True)
+			stereoOut = os.path.join(stereoDir, os.path.basename(base) + "_stereo.png")
+
+			maskOut = None
+			if maskBase is not None:
+				maskDir = os.path.join(maskBase, f"ipd_{ipdMM:03d}")
+				os.makedirs(maskDir, exist_ok=True)
+				maskOut = os.path.join(maskDir, os.path.basename(base) + "_mask.png")
+
+			return (ipdMM / 1000.0, stereoOut, maskOut)
 
 		spatial_photo(
-			orgImagePath  = inputPath,
-			plyPath       = plyPath,
-			outGLB        = outGLB,
-			outStereoImages = [(args.ipd, outStereo, outMask)],
+			orgImagePath    = inputPath,
+			plyPath         = plyPath,
+			outGLB          = outGLB,
+			outStereoImages = [single_stereo_entry(ipdMM) for ipdMM in args.ipd],
 		)
