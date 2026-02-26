@@ -892,10 +892,111 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
 # ------------------------------------------- #
 
 if __name__ == "__main__":
-	spatial_photo_sequence(
-	    frameIndices=range(1, 146),
-	    orgImagePathFn =lambda i: f"insidious/clip1/frames/frame_{i:03d}.png",
-	    plyPathFn      =lambda i: f"insidious/clip1/plys/frame_{i:03d}.ply",
-	    outGLBFn       =None,#lambda i: f"insidious/clip2/glbs/frame_{i:03d}.glb",
-	    outStereoImagesFn=lambda i: [(0.064, f"insidious/clip1/stereo/frame_{i:03d}.png", f"insidious/clip1/stereo_mask/frame_{i:03d}.png")]
-	)
+	import argparse
+	import glob
+	import re
+
+	# setup argparse:
+	# ---------------
+	parser = argparse.ArgumentParser(description="Generate spatial photos / stereo image sequences from ML-Sharp outputs")
+
+	parser.add_argument("input", help=(
+		"Either a single source image (e.g. photo.png) or a directory containing "
+		"'frames/' and 'plys/' subdirectories for sequence mode."
+	))
+
+	parser.add_argument("--start", type=int, default=None, help="First frame index to process (sequence mode only).")
+	parser.add_argument("--end",   type=int, default=None, help="Last frame index to process, inclusive (sequence mode only).")
+	parser.add_argument("--frame-digits", type=int, default=3, help="Zero-padding width for frame filenames, e.g. 3 → frame_001.png (default: 3).")
+	parser.add_argument("--frame-prefix", type=str, default="frame_", help="Filename prefix for frame/ply files (default: 'frame_').")
+
+	parser.add_argument("--ply", type=str, default=None, help="Path to PLY file (single file mode only; inferred from input path otherwise).")
+
+	parser.add_argument("--out-glb",    type=str, default=None, help="Output GLB path or directory (sequence mode writes per-frame GLBs here).")
+	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo image path or directory.")
+	parser.add_argument("--out-mask",   type=str, default=None, help="Output stereo mask image path or directory (requires --out-stereo).")
+	parser.add_argument("--ipd",        type=float, default=0.064, help="Interpupillary distance in metres for stereo render (default: 0.064).")
+
+	args = parser.parse_args()
+
+	# get paths:
+	# ---------------
+	inputPath = args.input
+	isDir = os.path.isdir(inputPath)
+
+	def out_path(base, fi, digits, prefix, ext):
+		os.makedirs(base, exist_ok=True)
+		return os.path.join(base, f"{prefix}{fi:0{digits}d}{ext}")
+
+	# sequence mode:
+	# ---------------
+	if isDir:
+		framesDir = os.path.join(inputPath, "frames")
+		plysDir   = os.path.join(inputPath, "plys")
+
+		if not os.path.isdir(framesDir):
+			parser.error(f"Expected a 'frames/' subdirectory inside '{inputPath}'.")
+		if not os.path.isdir(plysDir):
+			parser.error(f"Expected a 'plys/' subdirectory inside '{inputPath}'.")
+
+		digits = args.frame_digits
+		prefix = args.frame_prefix
+
+		pattern = re.compile(rf"^{re.escape(prefix)}(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
+		available = sorted(
+			int(m.group(1))
+			for f in os.listdir(framesDir)
+			if (m := pattern.match(f))
+		)
+
+		if not available:
+			parser.error(f"No frame files matching '{prefix}<N>.png/jpg' found in '{framesDir}'.")
+
+		start = args.start if args.start is not None else available[0]
+		end   = args.end   if args.end   is not None else available[-1]
+
+		frameIndices = [i for i in available if start <= i <= end]
+		if not frameIndices:
+			parser.error(f"No frames found in the range [{start}, {end}].")
+
+		def frame_ext(fi):
+			for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+				p = os.path.join(framesDir, f"{prefix}{fi:0{digits}d}{ext}")
+				if os.path.exists(p):
+					return ext
+			return ".png"
+
+		spatial_photo_sequence(
+			frameIndices     = frameIndices,
+			orgImagePathFn   = lambda i: os.path.join(framesDir, f"{prefix}{i:0{digits}d}{frame_ext(i)}"),
+			plyPathFn        = lambda i: os.path.join(plysDir,   f"{prefix}{i:0{digits}d}.ply"),
+			outGLBFn         = (lambda i: out_path(args.out_glb,    i, digits, prefix, ".glb")) if args.out_glb    else None,
+			outStereoImagesFn= (lambda i: [(
+				args.ipd,
+				out_path(args.out_stereo, i, digits, prefix, ".png"),
+				out_path(args.out_mask,   i, digits, prefix, ".png") if args.out_mask else None,
+			)]) if args.out_stereo else None,
+		)
+
+	# single file mode:
+	# ---------------
+	else:
+		if not os.path.isfile(inputPath):
+			parser.error(f"'{inputPath}' is not a file or directory.")
+
+		base, imgExt = os.path.splitext(inputPath)
+		plyPath = args.ply if args.ply else base + ".ply"
+
+		if not os.path.isfile(plyPath):
+			parser.error(f"PLY file not found: '{plyPath}'. Use --ply to specify its path.")
+
+		outGLB    = args.out_glb    if args.out_glb    else base + ".glb"
+		outStereo = args.out_stereo if args.out_stereo else base + "_stereo.png"
+		outMask   = args.out_mask   if args.out_mask   else None
+
+		spatial_photo(
+			orgImagePath  = inputPath,
+			plyPath       = plyPath,
+			outGLB        = outGLB,
+			outStereoImages = [(args.ipd, outStereo, outMask)],
+		)
