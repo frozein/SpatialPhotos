@@ -32,9 +32,9 @@ def export_glb(atlas, positions, uvs, indices, outPath):
 			gltf.BufferView(buffer=0, byteOffset=positions.nbytes + uvs.nbytes, byteLength=indices.nbytes, target=gltf.ELEMENT_ARRAY_BUFFER)
 		],
 		accessors=[
-			gltf.Accessor(bufferView=0, componentType=gltf.FLOAT, count=len(positions)//3, type="VEC3"),
-			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs)//2, type="VEC2"),
-			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices), type="SCALAR")
+			gltf.Accessor(bufferView=0, componentType=gltf.FLOAT, count=len(positions), type="VEC3"),
+			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs), type="VEC2"),
+			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices.flat), type="SCALAR")
 		],
 		images=[gltf.Image(uri="data:image/png;base64," + base64.b64encode(imgBytes).decode())],
 		textures=[gltf.Texture(source=0)],

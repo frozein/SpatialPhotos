@@ -26,7 +26,7 @@ NUM_SLICES = 30
 BLOCK_SIZE = 64
 
 ALPHA_REPLACE_THRESHOLD = 0.1
-ALPHA_TEST_THRESHOLD = 0.5
+ALPHA_TEST_THRESHOLD = 128
 
 DEPTH_INFILL_CUTOFF = 0.1
 DEPTH_INFILL_OUTLIER_STD = 2.0
@@ -36,7 +36,12 @@ ATLAS_MAX_SIZE = 8192
 
 UV_PADDING = 0.0
 
-IPD = 0.016
+MOTION_THRESHOLD = 10.0
+MOTION_THUMB_SIZE = (128, 72)
+TEMPORAL_WINDOW = 0
+
+BLEED_K = -1
+BLEED_COLOR_TOLERANCE = 20
 
 # ------------------------------------------- #
 
@@ -116,6 +121,65 @@ def get_slice(gaussians, zMin, zMax, numSlices, idx, includeBehind=False):
 
 	return means[where], scales[where], rotations[where], opacities[where], colors[where]
 
+def compute_motion_score(imgA, imgB):
+	a = imgA.convert('L').resize(MOTION_THUMB_SIZE, Image.BILINEAR)
+	b = imgB.convert('L').resize(MOTION_THUMB_SIZE, Image.BILINEAR)
+
+	ta = torch.tensor(np.array(a), dtype=torch.float32)
+	tb = torch.tensor(np.array(b), dtype=torch.float32)
+	
+	return (ta - tb).abs().mean().item()
+
+def temporal_smooth_slices(frameWindow, centerIdx, gtMasks):
+	centerSlices = frameWindow[centerIdx]
+	centerGtMasks = gtMasks[centerIdx]
+
+	img0 = centerSlices[0][0]
+	
+	S = len(centerSlices)
+	H, W = img0.shape[0], img0.shape[1]
+
+	smoothed = [[img.clone(), depth.clone()] for (img, depth) in centerSlices]
+	frameImgs = [
+		[frameWindow[f][s][0].float() for s in range(S)]
+		for f in range(len(frameWindow))
+	]
+
+	for s in range(S):
+		centerImg  = smoothed[s][0]
+		centerGtMask = centerGtMasks[s]
+
+		accRgba  = torch.zeros((H, W, 4), dtype=torch.float32, device='cuda')
+		accCount = torch.zeros((H, W),    dtype=torch.float32, device='cuda')
+
+		for fi in range(len(frameWindow)):
+			src = frameImgs[fi][s if s < S else S - 1]
+
+			rgba  = src
+			alpha = src[..., 3]
+
+			found = alpha > 128
+			bestRgba = rgba.clone()
+
+			accRgba[found]  += bestRgba[found]
+			accCount[found] += 1.0
+
+		hasData      = accCount > 0
+		smoothedRgba = torch.zeros((H, W, 4), dtype=torch.float32, device='cuda')
+		smoothedRgba[hasData] = accRgba[hasData] / accCount[hasData].unsqueeze(-1)
+
+		applyMask = (~centerGtMask) & (centerImg[..., 3] > 128) & hasData
+
+		ys, xs = applyMask.nonzero(as_tuple=True)
+		centerImg[ys, xs, 0] = smoothedRgba[ys, xs, 0].to(torch.uint8)
+		centerImg[ys, xs, 1] = smoothedRgba[ys, xs, 1].to(torch.uint8)
+		centerImg[ys, xs, 2] = smoothedRgba[ys, xs, 2].to(torch.uint8)
+		centerImg[ys, xs, 3] = smoothedRgba[ys, xs, 3].to(torch.uint8)
+
+		smoothed[s][0] = centerImg
+
+	return smoothed
+
 def maximal_rectangles(mask):
 	h, w = mask.shape
 	heights = np.zeros(w, dtype=int)
@@ -192,20 +256,22 @@ def pack_blocks(mergedBlockDims):
 	return finalPacker
 
 
-def generate_block_atlas(slices, blockSize):
+def generate_block_atlas(slicesGeom, slicesRender=None):
 	mergedMeta = []
 	mergedDims = []
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, _) in enumerate(tqdm(slices, desc="Greedy meshing slices", unit="slice")):
+	print("Greedy meshing slices...")
+
+	for idx, (img, _) in enumerate(slicesGeom):
 		H, W, _ = img.shape
-		GH, GW = H // blockSize, W // blockSize
+		GH, GW = H // BLOCK_SIZE, W // BLOCK_SIZE
 
-		alpha = img[:GH*blockSize, :GW*blockSize, 3]
-		alpha = alpha.reshape(GH, blockSize, GW, blockSize)
+		alpha = img[:GH*BLOCK_SIZE, :GW*BLOCK_SIZE, 3]
+		alpha = alpha.reshape(GH, BLOCK_SIZE, GW, BLOCK_SIZE)
 
-		present = (alpha >= int(ALPHA_TEST_THRESHOLD * 255)).any(dim=1).any(dim=2)
+		present = (alpha >= ALPHA_TEST_THRESHOLD).any(dim=1).any(dim=2)
 		presentCpu = present.cpu().numpy()
 
 		if not np.any(presentCpu):
@@ -214,8 +280,8 @@ def generate_block_atlas(slices, blockSize):
 		rects = greedy_mesh(presentCpu)
 
 		for (gx, gy, gw, gh) in rects:
-			px, py = gx * blockSize, gy * blockSize
-			pw, ph = gw * blockSize, gh * blockSize
+			px, py = gx * BLOCK_SIZE, gy * BLOCK_SIZE
+			pw, ph = gw * BLOCK_SIZE, gh * BLOCK_SIZE
 
 			blockCoords = [(gx + dx, gy + dy) for dy in range(gh) for dx in range(gw)]
 			mergedMeta.append((idx, px, py, pw, ph, blockCoords))
@@ -223,7 +289,7 @@ def generate_block_atlas(slices, blockSize):
 
 	# pack greedy meshed rects:
 	# ---------------
-	print("Packing slices into atlas... ", end='', flush=True)
+	print("Packing slices into atlas... ")
 
 	packer = pack_blocks(mergedDims)
 
@@ -238,38 +304,36 @@ def generate_block_atlas(slices, blockSize):
 		_, ax, ay, aw, ah, i = rect
 
 		sliceIdx, srcPx, srcPy, pw, ph, blockCoords = mergedMeta[i]
-		img, _ = slices[sliceIdx]
+		img, _ = slicesGeom[sliceIdx] if slicesRender is None else slicesRender[sliceIdx]
 
 		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
 		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
 
 		for (gx, gy) in blockCoords:
-			bx = gx * blockSize
-			by = gy * blockSize
+			bx = gx * BLOCK_SIZE
+			by = gy * BLOCK_SIZE
 
 			ox = bx - srcPx
 			oy = by - srcPy
 
 			u0 = (ax + ox + UV_PADDING) / atlasW
 			v0 = (ay + oy + UV_PADDING) / atlasH
-			u1 = (ax + ox + blockSize - UV_PADDING) / atlasW
-			v1 = (ay + oy + blockSize - UV_PADDING) / atlasH
+			u1 = (ax + ox + BLOCK_SIZE - UV_PADDING) / atlasW
+			v1 = (ay + oy + BLOCK_SIZE - UV_PADDING) / atlasH
 
 			placements.append((sliceIdx, bx, by, u0, v1, u1, v0))
 
 	alpha = atlas[..., 3]
-	transparent = alpha < int(ALPHA_TEST_THRESHOLD * 255)
+	transparent = alpha < ALPHA_TEST_THRESHOLD
 
 	atlas[transparent] = 0
 	atlas[..., 3][~transparent] = 255
 
-	print('done')
-
 	return atlas, placements
 
-def fill_block_depths(placements, slices, blockSize):
+def fill_block_depths(placements, slices):
 
-	B = blockSize
+	B = BLOCK_SIZE
 
 	# collect unique blocks:
 	# ---------------
@@ -360,7 +424,7 @@ def fill_block_depths(placements, slices, blockSize):
 
 	return {keys[i]: filled[i] for i in range(N)}
 
-def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
+def build_geometry(placements, slices, width, height, focal, aspect):
 
 	# sort blocks by slice idx:
 	# ---------------
@@ -369,46 +433,49 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 	# infill depth for each block:
 	# ---------------
-	print("Filling block depths... ", end='', flush=True)
+	print("Filling block depths...")
 
-	blockDepths = fill_block_depths(placements, slices, blockSize)
-	
-	print('done')
+	blockDepths = fill_block_depths(placements, slices)
 
 	# average depth at corners, enforce monotonicity:
 	# ---------------
+	print("Computing vertex depths...")
+
 	S  = NUM_SLICES
-	GW = width  // blockSize
-	GH = height // blockSize
+	GW = width  // BLOCK_SIZE
+	GH = height // BLOCK_SIZE
 
 	zGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device='cuda')
 	countGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device='cuda')
 
-	CORNER_OFFSETS = [
-		(0, 0, 0,             0            ),
-		(1, 0, 0,             blockSize - 1),
-		(0, 1, blockSize - 1, 0            ),
-		(1, 1, blockSize - 1, blockSize - 1),
-	]
-	for (sliceIdx, px, py, *_) in tqdm(placements, desc="Building Z grid", unit="block"):
-		key = (sliceIdx, px, py)
-		if key not in blockDepths:
-			continue
+	plSliceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long, device='cuda')
+	plGx = torch.tensor([p[1] // BLOCK_SIZE for p in placements], dtype=torch.long, device='cuda')
+	plGy = torch.tensor([p[2] // BLOCK_SIZE for p in placements], dtype=torch.long, device='cuda')
 
-		block = blockDepths[key]
-		gx = px // blockSize
-		gy = py // blockSize
+	cornerDGx = torch.tensor([0, 1, 0, 1], dtype=torch.long, device='cuda')
+	cornerDGy = torch.tensor([0, 0, 1, 1], dtype=torch.long, device='cuda')
+	cornerRow = torch.tensor([0, 0, BLOCK_SIZE-1, BLOCK_SIZE-1], dtype=torch.long, device='cuda')
+	cornerCol = torch.tensor([0, BLOCK_SIZE-1, 0, BLOCK_SIZE-1], dtype=torch.long, device='cuda')
 
-		for (dgx, dgy, row, col) in CORNER_OFFSETS:
-			cvx = gx + dgx
-			cvy = gy + dgy
-			if cvx > GW or cvy > GH:
-				continue
-				
-			val = block[row, col]
-			zGrid[sliceIdx, cvy, cvx]     += val
-			countGrid[sliceIdx, cvy, cvx] += 1.0
+	cvx = (plGx.unsqueeze(1) + cornerDGx.unsqueeze(0)).clamp(max=GW)
+	cvy = (plGy.unsqueeze(1) + cornerDGy.unsqueeze(0)).clamp(max=GH)
+	s   = plSliceIdx.unsqueeze(1).expand(N, 4)
 
+	keysList = [(p[0], p[1], p[2]) for p in placements]
+	blocksTensor = torch.stack([blockDepths[(si, px, py)] for (si, px, py) in keysList])
+	vals = blocksTensor[:, cornerRow, cornerCol]
+
+	validBounds = (plGx.unsqueeze(1) + cornerDGx.unsqueeze(0) <= GW) & \
+	              (plGy.unsqueeze(1) + cornerDGy.unsqueeze(0) <= GH)
+	validDepth = vals > 0.0
+	valid = validBounds & validDepth
+
+	flatIdx = (s * (GH+1) * (GW+1) + cvy * (GW+1) + cvx).reshape(-1)  # (N*4,)
+	flatVals = (vals  * valid.float()).reshape(-1)
+	latCount = valid.float().reshape(-1)
+
+	zGrid    .reshape(-1).scatter_add_(0, flatIdx, flatVals)
+	countGrid.reshape(-1).scatter_add_(0, flatIdx, latCount)
 
 	hasData = countGrid > 0
 	zGrid[hasData] = zGrid[hasData] / countGrid[hasData]
@@ -417,8 +484,10 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 	# compute worldspace vertex coordinates:
 	# ---------------
-	gxCoords = torch.arange(GW + 1, device='cuda', dtype=torch.float32) * blockSize
-	gyCoords = torch.arange(GH + 1, device='cuda', dtype=torch.float32) * blockSize
+	print("Computing vertex coordinates...")
+
+	gxCoords = torch.arange(GW + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
+	gyCoords = torch.arange(GH + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
 
 	xOffset = gxCoords - width  * 0.5
 	yOffset = height * 0.5 - gyCoords
@@ -432,6 +501,8 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 
 	# compute positions and uvs:
 	# ---------------
+	print("Building vertex buffers...")
+
 	plSiceIdx  = torch.tensor([p[0] for p in placements], dtype=torch.long,  device='cuda')
 	plPx = torch.tensor([p[1] for p in placements], dtype=torch.long,  device='cuda')
 	plPy = torch.tensor([p[2] for p in placements], dtype=torch.long,  device='cuda')
@@ -440,8 +511,8 @@ def build_geometry(placements, slices, width, height, blockSize, focal, aspect):
 	plU1 = torch.tensor([p[5] for p in placements], dtype=torch.float32, device='cuda')
 	plV1 = torch.tensor([p[6] for p in placements], dtype=torch.float32, device='cuda')
 
-	gx0 = plPx // blockSize
-	gy0 = plPy // blockSize
+	gx0 = plPx // BLOCK_SIZE
+	gy0 = plPy // BLOCK_SIZE
 	gx1 = gx0 + 1
 	gy1 = gy0 + 1
 
@@ -495,7 +566,10 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 
 	insideGT = (xx >= offX) & (xx < offX + orgWidth) & (yy >= offY) & (yy < offY + orgHeight)
 
-	for s in range(len(slices)):
+	S = len(slices)
+	gtMask = torch.zeros((S, H, W), dtype=torch.bool, device='cuda')
+
+	for s in range(S):
 		mask = (firstHit == s) & hitAny & insideGT
 
 		if not mask.any():
@@ -505,183 +579,271 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 		fy = flatIdx[:, 0]
 		fx = flatIdx[:, 1]
 
-		org_x = fx - offX
-		org_y = fy - offY
+		orgX = fx - offX
+		orgY = fy - offY
 
-		slices[s][0][fy, fx, :3] = orgRGB[org_y, org_x]
+		slices[s][0][fy, fx, :3] = orgRGB[orgY, orgX]
+		gtMask[s, fy, fx] = True
 
-	return slices
+		if BLEED_K >= 0 and s + 1 < S:
+			transparentMap = (slices[s][0][..., 3] < ALPHA_TEST_THRESHOLD).float()
+			transparentMap = transparentMap.unsqueeze(0).unsqueeze(0)
+			nearTransparent = torch.nn.functional.max_pool2d(
+				transparentMap,
+				kernel_size=2 * BLEED_K + 1,
+				stride=1,
+				padding=BLEED_K,
+			).squeeze(0).squeeze(0).bool()
+
+			nextAboveThresh = slices[s + 1][0][..., 3] >= ALPHA_TEST_THRESHOLD
+
+			nextRgb = slices[s + 1][0][..., :3].float()
+
+			gtRGB = torch.zeros((H, W, 3), dtype=torch.float32, device='cuda')
+			gtRGB[fy, fx] = orgRGB[orgY, orgX].float()
+
+			colorDiff  = (nextRgb - gtRGB).abs().mean(dim=-1)  # (H, W)
+			colorClose = colorDiff <= BLEED_COLOR_TOLERANCE
+
+			bleedMask = mask & nearTransparent & nextAboveThresh & colorClose
+
+			bleedIdx = bleedMask.nonzero(as_tuple=False)
+			by = bleedIdx[:, 0]
+			bx = bleedIdx[:, 1]
+
+			bOrgX = bx - offX
+			bOrgY = by - offY
+
+			slices[s + 1][0][by, bx, :3] = orgRGB[bOrgY, bOrgX]
+			gtMask[s + 1, by, bx] = True
+
+	return slices, gtMask
 
 # ------------------------------------------- #
 
-def mlsharp_to_spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
+def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, outStereoImagesFn):
 
 	torch.set_default_device('cuda')
 
-	# load original image:
+	# get total frame count:
 	# ---------------
-	print('Reading original image... ', end='', flush=True)
+	frameIndices = list(frameIndices)
+	total = len(frameIndices)
 
-	orgImage  = Image.open(orgImagePath)
-	orgWidth  = orgImage.width
-	orgHeight = orgImage.height
+	# get dimensions:
+	# ---------------
+	firstOrg = Image.open(orgImagePathFn(frameIndices[0]))
+	orgWidth, orgHeight = firstOrg.width, firstOrg.height
+	firstOrg.close()
 
 	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * orgWidth)
 	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * orgHeight)
 	outfilledWidth  = (outfilledWidth  // BLOCK_SIZE) * BLOCK_SIZE
 	outfilledHeight = (outfilledHeight // BLOCK_SIZE) * BLOCK_SIZE
-
 	aspect = outfilledWidth / outfilledHeight
-	
-	print('done')
 
-	# load ply:
+	# init sliding window buffers:
 	# ---------------
-	print('Reading gaussians... ', end='', flush=True)
+	orgImageCache   = {}
+	slicesCache     = {}
+	gtMaskCache     = {}
+	projMatrixCache = {}
+	settingsCache   = {}
 
-	gaussians, focalY = load_ply(plyPath)
-	fov = 2 * math.atan(outfilledHeight / (2 * focalY))
+	def load_frame(pos):
+		if pos in slicesCache:
+			return
 
-	print('done')
+		fi = frameIndices[pos]
+		print(f'Loading frame {fi}...')
 
-	# create render settings:
-	# ---------------
-	eye    = torch.tensor([0.0, 0.0, 0.0])
-	target = torch.tensor([0.0, 0.0, 1.0])
-	up     = torch.tensor([0.0, 1.0, 0.0])
-	view   = look_at(eye, target, up)
-
-	proj   = perspective(fov, aspect, 0.1, 1000.0)
-	focalX = focalY
-
-	settings = ddgs.Settings(
-		width=outfilledWidth, height=outfilledHeight,
-		view=view, proj=proj,
-		focalX=focalX, focalY=focalY,
-		outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
-		debug=False
-	)
-
-	# render slices:
-	# ---------------
-	means = gaussians[0]
-	zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
-	zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
-
-	slices = []
-
-	for i in tqdm(range(NUM_SLICES), desc='Rendering slices', unit='slice'):
-		with torch.no_grad():
-			render = ddgs.render(
-				settings, 
-				*get_slice(
-					gaussians, 
-					zMin, zMax, 
-					NUM_SLICES, i
-				)
-			)
-
-			renderBehind = ddgs.render(
-				settings, 
-				*get_slice(
-					gaussians, 
-					zMin, zMax, 
-					NUM_SLICES, i, 
-					includeBehind=True
-				)
-			)
-
-		color = renderBehind.color
-		alpha = render.alpha
-		depth = render.depth
-
-		img = torch.cat([color, alpha], dim=-1)
-		img = (img * 255).to(torch.uint8)
-
-		depth[depth > zMax] = zMax
-		depth[(depth < zMin) & (depth > 0)] = zMin
-
-		slices.append([img, depth])
-
-	# replace pixels where GT data exists:
-	# ---------------
-	print('Replacing renders with GT color... ', end='', flush=True)
-
-	replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth, orgHeight)
-	
-	print('done')
-
-	# generate geometry:
-	# ---------------
-	atlas, placements = generate_block_atlas(slices, BLOCK_SIZE)
-
-	positions, uvs, indices = build_geometry(
-		placements, slices,
-		outfilledWidth, outfilledHeight,
-		BLOCK_SIZE, focalY, aspect
-	)
-
-	atlasCpu = atlas.cpu().numpy()
-	positionsCpu = positions.cpu().numpy()
-	uvsCpu = uvs.cpu().numpy()
-	indicesCpu = indices.cpu().numpy()
-
-	# sace as GLB:
-	# ---------------
-	if outGLB is not None:
-		print('Writing GLB... ', end='', flush=True)
-
-		exporter.export_glb(atlasCpu, positions, uvs, indices, outGLB)
+		# load src
+		print(f'    Loading source image and ply...')
 		
-		print('done')
+		orgImage  = Image.open(orgImagePathFn(fi))
+		gaussians, focalY = load_ply(plyPathFn(fi))
 
-	# render stereo images:
-	# ---------------
-	if outStereoImages is not None:
-		scene = renderer.upload_scene(
-			positionsCpu, uvsCpu, indicesCpu, 
-			atlasCpu, (orgWidth, orgHeight)
+		orgImageCache[pos] = orgImage.copy().convert('RGB')
+		fov = 2 * math.atan(outfilledHeight / (2 * focalY))
+
+		eye    = torch.tensor([0.0, 0.0, 0.0])
+		target = torch.tensor([0.0, 0.0, 1.0])
+		up     = torch.tensor([0.0, 1.0, 0.0])
+		view   = look_at(eye, target, up)
+		proj   = perspective(fov, aspect, 0.1, 1000.0)
+
+		settings = ddgs.Settings(
+			width=outfilledWidth, height=outfilledHeight,
+			view=view, proj=proj,
+			focalX=focalY, focalY=focalY,
+			outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
+			debug=False
 		)
 
-		try:
-			for (ipd, path) in tqdm(outStereoImages, desc='Rendering stereo images', unit='image'):
-				eyeLeft     = torch.tensor([ ipd / 2, 0.0, 0.0])
-				targetLeft  = torch.tensor([ ipd / 2, 0.0, 1.0])
-				viewLeft = look_at(eyeLeft, targetLeft, up)
+		means = gaussians[0]
+		zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
+		zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
 
-				eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
-				targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
-				viewRight = look_at(eyeRight, targetRight, up)
+		# render slices
+		print(f'    Rendering slices...')
 
-				imgLeft = renderer.render_view(
-					scene,
-					viewLeft.cpu().numpy(), 
-					proj.cpu().numpy()
+		slices = []
+		for i in range(NUM_SLICES):
+			with torch.no_grad():
+				render = ddgs.render(
+					settings,
+					*get_slice(gaussians, zMin, zMax, NUM_SLICES, i)
 				)
-				imgRight = renderer.render_view(
-					scene,
-					viewRight.cpu().numpy(), 
-					proj.cpu().numpy()
+				renderBehind = ddgs.render(
+					settings,
+					*get_slice(gaussians, zMin, zMax, NUM_SLICES, i, includeBehind=True)
 				)
 
-				stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
-				stereo.paste(imgLeft, (0, 0))
-				stereo.paste(imgRight, (orgWidth, 0))
-				stereo.save(path, compress_level=1)
-		finally:
-			renderer.release_scene(scene)
+			color = renderBehind.color
+			alpha = render.alpha
+			depth = render.depth
+
+			img = torch.cat([color, alpha], dim=-1)
+			img = (img * 255).to(torch.uint8)
+
+			depth[depth > zMax] = zMax
+			depth[(depth < zMin) & (depth > 0)] = zMin
+
+			slices.append([img, depth])
+
+		# replace with GT
+		print(f'    Replacing renders with GT color...')
+
+		slices, gtMask = replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth, orgHeight)
+
+		slicesCache[pos] = slices
+		gtMaskCache[pos] = gtMask
+		projMatrixCache[pos] = proj
+
+	def evict_old_frames(centerPos):
+		for pos in list(slicesCache.keys()):
+			if pos < centerPos - TEMPORAL_WINDOW:
+				del slicesCache[pos]
+				del gtMaskCache[pos]
+				del projMatrixCache[pos]
+				del orgImageCache[pos]
+
+	# process each frame:
+	# ---------------
+	for centerPos in range(total):
+		fi = frameIndices[centerPos]
+		print(f'\n--- Processing frame {fi} ({centerPos+1}/{total}) ---\n')
+
+		windowStart = max(0, centerPos - TEMPORAL_WINDOW)
+		windowEnd   = min(total - 1, centerPos + TEMPORAL_WINDOW)
+
+		# load each frame needed for smoothing
+		for pos in range(windowStart, windowEnd + 1):
+			load_frame(pos)
+
+		# build smoothing list, exclude frames with high motion
+		centerImg = orgImageCache[centerPos]
+		windowSlices  = []
+		windowGtMasks = []
+		excluded = 0
+		for pos in range(windowStart, windowEnd + 1):
+			if pos == centerPos:
+				windowSlices.append(slicesCache[pos])
+				windowGtMasks.append(gtMaskCache[pos])
+			else:
+				score = compute_motion_score(centerImg, orgImageCache[pos])
+				if score <= MOTION_THRESHOLD:
+					windowSlices.append(slicesCache[pos])
+					windowGtMasks.append(gtMaskCache[pos])
+				else:
+					excluded += 1
+					print(f'Excluding frame pos={pos} from temporal smoothing (score={score:.1f} > threshold={MOTION_THRESHOLD})')
+
+		centerInWindow = sum(
+			1 for pos in range(windowStart, centerPos)
+			if compute_motion_score(centerImg, orgImageCache[pos]) <= MOTION_THRESHOLD
+		)
+
+		# temporal smoothing
+		print(f'Applying temporal smoothing...')
+
+		smoothedSlices = temporal_smooth_slices(
+			frameWindow=windowSlices,
+			centerIdx=centerInWindow,
+			gtMasks=windowGtMasks
+		)
+
+		# generate block atlas
+		originalSlices = slicesCache[centerPos]
+		atlas, placements = generate_block_atlas(originalSlices, smoothedSlices)
+
+		# build geometry
+		proj = projMatrixCache[centerPos]
+
+		positions, uvs, indices = build_geometry(
+			placements, originalSlices,
+			outfilledWidth, outfilledHeight,
+			float(proj[1, 1].item() * outfilledHeight / 2),
+			aspect
+		)
+
+		atlasCpu     = atlas.cpu().numpy()
+		positionsCpu = positions.cpu().numpy()
+		uvsCpu       = uvs.cpu().numpy()
+		indicesCpu   = indices.cpu().numpy()
+
+		# save GLB
+		outGLB = outGLBFn(fi) if outGLBFn else None
+		if outGLB is not None:
+			print(f'Writing GLB to {outGLB}...')
+			exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
+
+		# render stereo images
+		outStereoImages = outStereoImagesFn(fi) if outStereoImagesFn else None
+		if outStereoImages is not None:
+			up = torch.tensor([0.0, 1.0, 0.0])
+			scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight))
+
+			try:
+				for (ipd, path) in outStereoImages:
+					print(f'Saving stereo render: {path}...')
+
+					eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
+					targetLeft = torch.tensor([ ipd / 2, 0.0, 1.0])
+					viewLeft   = look_at(eyeLeft, targetLeft, up)
+
+					eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
+					targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
+					viewRight   = look_at(eyeRight, targetRight, up)
+
+					imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  proj.cpu().numpy())
+					imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), proj.cpu().numpy())
+
+					stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
+					stereo.paste(imgLeft,  (0, 0))
+					stereo.paste(imgRight, (orgWidth, 0))
+					stereo.save(path, compress_level=1)
+			finally:
+				renderer.release_scene(scene)
+
+		evict_old_frames(centerPos)
+
+def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
+	spatial_photo_sequence(
+	    frameIndices=range(1),
+	    orgImagePathFn =lambda i: orgImagePath,
+	    plyPathFn      =lambda i: plyPath,
+	    outGLBFn       =lambda i: outGLB,
+	    outStereoImagesFn=lambda i: outStereoImages
+	)
 
 # ------------------------------------------- #
 
 if __name__ == "__main__":
-	for i in range(1, 74):
-		mlsharp_to_spatial_photo(
-			orgImagePath=f"insidious/clip2/frames/frame_{i:03d}.png",
-			plyPath     =f"insidious/clip2/plys/frame_{i:03d}.ply",
-			outGLB      =None,#"insidious/clip2/glbs/frame_044.glb",
-			outStereoImages=[
-				(0.064, f"insidious/clip2/stereo/frame_{i:03d}.png")
-			],
-		)
-
-		print(f"FINISHED FRAME {i}")
+	spatial_photo_sequence(
+	    frameIndices=range(1, 146),
+	    orgImagePathFn =lambda i: f"insidious/clip1/frames/frame_{i:03d}.png",
+	    plyPathFn      =lambda i: f"insidious/clip1/plys/frame_{i:03d}.ply",
+	    outGLBFn       =None,#lambda i: f"insidious/clip2/glbs/frame_{i:03d}.glb",
+	    outStereoImagesFn=lambda i: [(0.064, f"insidious/clip1/stereo/frame_{i:03d}.png")]
+	)
