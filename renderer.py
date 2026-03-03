@@ -39,7 +39,7 @@ program = ctx.program(
 			if(color.a < 1.0 / 255.0)
 				discard;
 
-			o_color = vec4(color.rgb * color.a, color.a);
+			o_color = vec4(color.rgb, color.a);
 		}
 	''',
 )
