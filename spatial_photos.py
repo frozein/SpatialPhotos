@@ -884,6 +884,9 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 				maskScene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, maskAtlasCpu, (orgWidth, orgHeight))
 
 			try:
+				fovRender = 2 * math.atan(orgHeight / (2 * focal))
+				projRender = perspective(fovRender, outfilledWidth / outfilledHeight, 0.1, 1000.0)
+
 				viewData = []
 				for entry in outStereoImages:
 					ipd, path, maskPath = entry
@@ -896,8 +899,8 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 					targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
 					viewRight   = look_at(eyeRight, targetRight, up)
 
-					imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  proj.cpu().numpy())
-					imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), proj.cpu().numpy())
+					imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+					imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), projRender.cpu().numpy())
 
 					stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
 					stereo.paste(imgLeft,  (0, 0))
@@ -905,10 +908,12 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 
 					maskStereo = None
 					if maskPath is not None and maskScene is not None:
-						maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  proj.cpu().numpy())
-						maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), proj.cpu().numpy())
+						maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+						maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+
 						maskLeft  = maskLeft.convert('L')
 						maskRight = maskRight.convert('L')
+						
 						maskStereo = Image.new('L', (orgWidth * 2, orgHeight))
 						maskStereo.paste(maskLeft,  (0, 0))
 						maskStereo.paste(maskRight, (orgWidth, 0))
