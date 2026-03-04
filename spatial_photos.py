@@ -25,8 +25,8 @@ NUM_SLICES = 30
 
 BLOCK_SIZE = 64
 
-ALPHA_REPLACE_THRESHOLD = 1
-ALPHA_TEST_THRESHOLD = 128
+ALPHA_THRESHOLD = 1
+ALPHA_SOLID_THRESHOLD = 128
 
 DEPTH_INFILL_CUTOFF = 0.1
 DEPTH_INFILL_OUTLIER_STD = 2.0
@@ -35,13 +35,6 @@ ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
 
 UV_PADDING = 0.5
-
-MOTION_THRESHOLD = 10.0
-MOTION_THUMB_SIZE = (128, 72)
-TEMPORAL_WINDOW = 2
-
-DEPTH_SMOOTH_ALPHA = 0.3
-DEPTH_CROSS_SLICE_REL_TOLERANCE = 0.05
 
 # ------------------------------------------- #
 
@@ -90,7 +83,6 @@ def load_ply(path, device='cuda'):
 	rotations = np_to_torch(['rot_1', 'rot_2', 'rot_3', 'rot_0'])
 
 	numGaussians = means.shape[0]
-
 	colors = colors.reshape((numGaussians, 1, 3))
 
 	gaussians = (means, scales, rotations, opacities, colors)
@@ -100,19 +92,19 @@ def load_ply(path, device='cuda'):
 
 # ------------------------------------------- #
 
-def slice_t(numSlices, idx):
-	return (idx / numSlices) * (idx / numSlices)
+def slice_t(idx):
+	return (idx / NUM_SLICES) * (idx / NUM_SLICES)
 
-def get_slice(gaussians, zMin, zMax, numSlices, idx, includeBehind=False):
+def get_slice(gaussians, zMin, zMax, idx):
 	means, scales, rotations, opacities, colors = gaussians
 
-	tMin = slice_t(numSlices, idx)
-	tMax = slice_t(numSlices, idx + 1)
+	tMin = slice_t(idx)
+	tMax = slice_t(idx + 1)
 
 	zMinSlice = zMin + tMin * (zMax - zMin)
 	zMaxSlice = zMin + tMax * (zMax - zMin)
 
-	if (idx == numSlices - 1) or includeBehind:
+	if (idx == NUM_SLICES - 1):
 		where = means[:, 2] >= zMinSlice
 	elif idx == 0:
 		where = means[:, 2] < zMaxSlice
@@ -120,15 +112,6 @@ def get_slice(gaussians, zMin, zMax, numSlices, idx, includeBehind=False):
 		where = (means[:, 2] >= zMinSlice) & (means[:, 2] < zMaxSlice)
 
 	return means[where], scales[where], rotations[where], opacities[where], colors[where]
-
-def compute_motion_score(imgA, imgB):
-	a = imgA.convert('L').resize(MOTION_THUMB_SIZE, Image.BILINEAR)
-	b = imgB.convert('L').resize(MOTION_THUMB_SIZE, Image.BILINEAR)
-
-	ta = torch.tensor(np.array(a), dtype=torch.float32)
-	tb = torch.tensor(np.array(b), dtype=torch.float32)
-	
-	return (ta - tb).abs().mean().item()
 
 def maximal_rectangles(mask):
 	h, w = mask.shape
@@ -170,7 +153,7 @@ def greedy_mesh(mask):
 	return rectsOut
 
 def pack_blocks(mergedBlockDims):
-	
+
 	# binary search to find best size:
 	# ---------------
 	def fits(size):
@@ -205,7 +188,7 @@ def pack_blocks(mergedBlockDims):
 
 	return finalPacker
 
-def generate_block_atlas_fast(slices, gtMasks=None):
+def generate_block_atlas(slices, gtMasks=None):
 
 	B = BLOCK_SIZE
 
@@ -214,15 +197,15 @@ def generate_block_atlas_fast(slices, gtMasks=None):
 	print("Collecting present blocks...")
 
 	meta = []
-	for idx, (img, _) in enumerate(slices):
+	for idx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // B, W // B
 
 		alpha = img[:GH*B, :GW*B, 3]
 		alpha = alpha.reshape(GH, B, GW, B)
-		
-		present = (alpha >= ALPHA_TEST_THRESHOLD).any(dim=1).any(dim=2)
-		
+
+		present = (alpha >= ALPHA_THRESHOLD).any(dim=1).any(dim=2)
+
 		gyIdx, gxIdx = present.nonzero(as_tuple=True)
 		for gy, gx in zip(gyIdx.tolist(), gxIdx.tolist()):
 			meta.append((idx, gx * B, gy * B))
@@ -254,7 +237,7 @@ def generate_block_atlas_fast(slices, gtMasks=None):
 		ax = (i % cols) * B
 		ay = (i // cols) * B
 
-		img, _ = slices[sliceIdx]
+		img, _, _ = slices[sliceIdx]
 		atlas[ay:ay+B, ax:ax+B] = img[srcPy:srcPy+B, srcPx:srcPx+B]
 
 		if maskAtlas is not None:
@@ -275,7 +258,7 @@ def generate_block_atlas_fast(slices, gtMasks=None):
 
 	return atlas, placements, maskAtlas
 
-def generate_block_atlas(slices, gtMasks=None):
+def generate_block_atlas_greedy(slices, gtMasks=None):
 	mergedMeta = []
 	mergedDims = []
 
@@ -290,7 +273,7 @@ def generate_block_atlas(slices, gtMasks=None):
 		alpha = img[:GH*BLOCK_SIZE, :GW*BLOCK_SIZE, 3]
 		alpha = alpha.reshape(GH, BLOCK_SIZE, GW, BLOCK_SIZE)
 
-		present = (alpha >= ALPHA_TEST_THRESHOLD).any(dim=1).any(dim=2)
+		present = (alpha >= ALPHA_THRESHOLD).any(dim=1).any(dim=2)
 		presentCpu = present.cpu().numpy()
 
 		if not np.any(presentCpu):
@@ -377,9 +360,13 @@ def fill_block_depths(placements, slices):
 	# build list of blocks to process:
 	# ---------------
 	blocks = torch.zeros((N, B, B), dtype=torch.float32, device='cuda')
+	sliceTs = torch.zeros(N, dtype=torch.float32, device='cuda')
+
 	for i, (sliceIdx, px, py) in enumerate(keys):
-		_, depth = slices[sliceIdx]
+		_, depth, slicePos = slices[sliceIdx]
+
 		blocks[i] = depth[py:py+B, px:px+B, 0]
+		sliceTs[i] = slicePos
 
 	# get per-block mean and stdev:
 	# ---------------
@@ -434,17 +421,18 @@ def fill_block_depths(placements, slices):
 	filled = flat.clone()
 	invalidFlat = ~validFlat
 
-	sparse = (validCount / (B * B)) < DEPTH_INFILL_CUTOFF
+	sparse   = (validCount / (B * B)) < DEPTH_INFILL_CUTOFF
 	useMean  = sparse.unsqueeze(1) & invalidFlat
 	usePlane = (~sparse).unsqueeze(1) & invalidFlat
 
 	filled[useMean]  = meanZ.unsqueeze(1).expand(N, B*B)[useMean]
 	filled[usePlane] = zEstFlat[usePlane]
 
-	noData = (validCount == 0).unsqueeze(1).expand(N, B*B)
-	filled[noData] = flat[noData]
+	noData = (validCount == 0)
+	filled[noData] = sliceTs[noData].unsqueeze(1).expand(-1, B*B)
 
-	noInlier = (inlierCount == 0).unsqueeze(1).expand(N, B*B)
+	noInlier = (inlierCount == 0) & ~noData
+	noInlier = noInlier.unsqueeze(1).expand(N, B*B)
 	filled[noInlier & invalidFlat] = meanZ.unsqueeze(1).expand(N, B*B)[noInlier & invalidFlat]
 
 	filled = filled.reshape(N, B, B)
@@ -511,67 +499,7 @@ def build_geometry(placements, slices, width, height, focal, aspect):
 
 	return zGrid, GW, GH
 
-def apply_depth_smoothing(zGrid, depthHistory):
-
-	S, GHp1, GWp1 = zGrid.shape
-	hasDepth = zGrid > 0.0
-
-	# initialize on first frame:
-	# ---------------
-	if 'ema' not in depthHistory:
-		depthHistory['ema']   = zGrid.clone()
-		depthHistory['valid'] = hasDepth.clone()
-
-		return zGrid
-
-	ema   = depthHistory['ema']
-	valid = depthHistory['valid']
-
-	# fill any region without history:
-	# ---------------
-	noHistory = hasDepth & ~valid
-	if noHistory.any():
-		for dSlice in [1, -1]:
-			if dSlice == 1:
-				neighbValid = torch.cat([valid[1:],  valid[-1:].new_zeros((1, GHp1, GWp1))],  dim=0)
-				neighbEma   = torch.cat([ema[1:],    ema[-1:].new_zeros((1, GHp1, GWp1))],    dim=0)
-			else:
-				neighbValid = torch.cat([valid[:1].new_zeros((1, GHp1, GWp1)), valid[:-1]],   dim=0)
-				neighbEma   = torch.cat([ema[:1].new_zeros((1, GHp1, GWp1)),   ema[:-1]],     dim=0)
-
-			depthClose = (
-				(neighbEma - zGrid).abs() <
-				DEPTH_CROSS_SLICE_REL_TOLERANCE * zGrid.clamp(min=1e-6)
-			)
-
-			canInherit = noHistory & neighbValid & depthClose
-
-			ema   = torch.where(canInherit, neighbEma, ema)
-			valid = valid | canInherit
-
-			noHistory = noHistory & ~canInherit
-
-	# apply smoothing:
-	# ---------------
-	alpha = DEPTH_SMOOTH_ALPHA
-
-	hasHistory = valid & hasDepth
-	newEma = torch.where(
-		hasHistory,
-		alpha * zGrid + (1.0 - alpha) * ema,
-		ema
-	)
-
-	newEma = torch.where(noHistory, zGrid, newEma)
-	newValid = valid | hasDepth
-
-	depthHistory['ema']   = newEma
-	depthHistory['valid'] = newValid
-
-	smoothed = torch.where(newValid & hasDepth, newEma, zGrid)
-	return smoothed
-
-def finish_geometry(smoothedZGrid, placements, width, height, focal, aspect):
+def finish_geometry(zGrid, placements, width, height, focal, aspect):
 	placements = sorted(placements, key=lambda x: x[0], reverse=True)
 	N = len(placements)
 
@@ -579,8 +507,9 @@ def finish_geometry(smoothedZGrid, placements, width, height, focal, aspect):
 	GW = width  // BLOCK_SIZE
 	GH = height // BLOCK_SIZE
 
-	# enforce monotonicity across slices
-	zGrid, _ = smoothedZGrid.cummax(dim=0)
+	# enforce monotonicity across slices:
+	# ---------------
+	zGrid, _ = zGrid.cummax(dim=0)
 
 	# compute worldspace vertex coordinates:
 	# ---------------
@@ -602,13 +531,13 @@ def finish_geometry(smoothedZGrid, placements, width, height, focal, aspect):
 	# ---------------
 	print("Building vertex buffers...")
 
-	plSiceIdx  = torch.tensor([p[0] for p in placements], dtype=torch.long,  device='cuda')
-	plPx = torch.tensor([p[1] for p in placements], dtype=torch.long,  device='cuda')
-	plPy = torch.tensor([p[2] for p in placements], dtype=torch.long,  device='cuda')
-	plU0 = torch.tensor([p[3] for p in placements], dtype=torch.float32, device='cuda')
-	plV0 = torch.tensor([p[4] for p in placements], dtype=torch.float32, device='cuda')
-	plU1 = torch.tensor([p[5] for p in placements], dtype=torch.float32, device='cuda')
-	plV1 = torch.tensor([p[6] for p in placements], dtype=torch.float32, device='cuda')
+	plSiceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long,   device='cuda')
+	plPx      = torch.tensor([p[1] for p in placements], dtype=torch.long,   device='cuda')
+	plPy      = torch.tensor([p[2] for p in placements], dtype=torch.long,   device='cuda')
+	plU0      = torch.tensor([p[3] for p in placements], dtype=torch.float32, device='cuda')
+	plV0      = torch.tensor([p[4] for p in placements], dtype=torch.float32, device='cuda')
+	plU1      = torch.tensor([p[5] for p in placements], dtype=torch.float32, device='cuda')
+	plV1      = torch.tensor([p[6] for p in placements], dtype=torch.float32, device='cuda')
 
 	gx0 = plPx // BLOCK_SIZE
 	gy0 = plPy // BLOCK_SIZE
@@ -617,7 +546,7 @@ def finish_geometry(smoothedZGrid, placements, width, height, focal, aspect):
 
 	cornerGx = torch.stack([gx0, gx1, gx1, gx0], dim=1)
 	cornerGy = torch.stack([gy1, gy1, gy0, gy0], dim=1)
-	cornerSliceIdx  = plSiceIdx.unsqueeze(1).expand(N, 4)
+	cornerSliceIdx = plSiceIdx.unsqueeze(1).expand(N, 4)
 
 	cx = xWorld[cornerSliceIdx, cornerGy, cornerGx]
 	cy = yWorld[cornerSliceIdx, cornerGy, cornerGx]
@@ -652,7 +581,7 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 		for i in range(len(slices))
 	], dim=0)
 
-	hitMask  = alphaStack > ALPHA_REPLACE_THRESHOLD
+	hitMask  = alphaStack > ALPHA_THRESHOLD
 	hitAny   = hitMask.any(dim=0)
 	firstHit = hitMask.to(torch.int32).argmax(dim=0)
 
@@ -688,20 +617,31 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 
 # ------------------------------------------- #
 
-def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, outStereoImagesFn):
+def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, skipExisting=False):
 
 	torch.set_default_device('cuda')
 
-	# get total frame count:
+	# skip if all outputs already exist:
 	# ---------------
-	frameIndices = list(frameIndices)
-	total = len(frameIndices)
+	if skipExisting:
+		paths = []
+		if outGLB is not None:
+			paths.append(outGLB)
+		if outStereoImages is not None:
+			for _, stereoPath, maskPath in outStereoImages:
+				if stereoPath is not None:
+					paths.append(stereoPath)
+				if maskPath is not None:
+					paths.append(maskPath)
+
+		if paths and all(os.path.isfile(p) for p in paths):
+			print('Skipping: all outputs already exist.')
+			return
 
 	# get dimensions:
 	# ---------------
-	firstOrg = Image.open(orgImagePathFn(frameIndices[0]))
-	orgWidth, orgHeight = firstOrg.width, firstOrg.height
-	firstOrg.close()
+	orgImage = Image.open(orgImagePath)
+	orgWidth, orgHeight = orgImage.width, orgImage.height
 
 	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * orgWidth)
 	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * orgHeight)
@@ -709,355 +649,279 @@ def spatial_photo_sequence(frameIndices, orgImagePathFn, plyPathFn, outGLBFn, ou
 	outfilledHeight = (outfilledHeight // BLOCK_SIZE) * BLOCK_SIZE
 	aspect = outfilledWidth / outfilledHeight
 
-	# init sliding window buffers:
+	# load src:
 	# ---------------
-	orgImageCache   = {}
-	slicesCache     = {}
-	gtMaskCache     = {}
-	projMatrixCache = {}
-	settingsCache   = {}
-	depthHistory = {}
+	print('Loading source image and ply...')
 
-	def load_frame(pos):
-		if pos in slicesCache:
-			return
+	gaussians, focalY = load_ply(plyPath)
 
-		fi = frameIndices[pos]
-		print(f'Loading frame {fi}...')
+	fov  = 2 * math.atan(outfilledHeight / (2 * focalY))
+	eye    = torch.tensor([0.0, 0.0, 0.0])
+	target = torch.tensor([0.0, 0.0, 1.0])
+	up     = torch.tensor([0.0, 1.0, 0.0])
+	view   = look_at(eye, target, up)
+	proj   = perspective(fov, aspect, 0.1, 1000.0)
 
-		# load src
-		print(f'    Loading source image and ply...')
-		
-		orgImage  = Image.open(orgImagePathFn(fi))
-		gaussians, focalY = load_ply(plyPathFn(fi))
+	settings = ddgs.Settings(
+		width=outfilledWidth, height=outfilledHeight,
+		view=view, proj=proj,
+		focalX=focalY, focalY=focalY,
+		outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
+		debug=False
+	)
 
-		orgImageCache[pos] = orgImage.copy().convert('RGB')
-		fov = 2 * math.atan(outfilledHeight / (2 * focalY))
+	means = gaussians[0]
+	zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
+	zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
 
-		eye    = torch.tensor([0.0, 0.0, 0.0])
-		target = torch.tensor([0.0, 0.0, 1.0])
-		up     = torch.tensor([0.0, 1.0, 0.0])
-		view   = look_at(eye, target, up)
-		proj   = perspective(fov, aspect, 0.1, 1000.0)
-
-		settings = ddgs.Settings(
-			width=outfilledWidth, height=outfilledHeight,
-			view=view, proj=proj,
-			focalX=focalY, focalY=focalY,
-			outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
-			debug=False
-		)
-
-		means = gaussians[0]
-		zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
-		zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
-
-		# render slices
-		print(f'    Rendering slices...')
-
-		slices = []
-		for i in range(NUM_SLICES):
-			with torch.no_grad():
-				render = ddgs.render(
-					settings,
-					*get_slice(gaussians, zMin, zMax, NUM_SLICES, i)
-				)
-
-			img = torch.cat([render.color, render.alpha], dim=-1)
-			img = (img * 255).to(torch.uint8)
-
-			render.depth[render.depth > zMax] = zMax
-			render.depth[(render.depth < zMin) & (render.depth > 0)] = zMin
-
-			slices.append([img, render.depth])
-
-		# replace with GT
-		print(f'    Replacing renders with GT color...')
-
-		slices, gtMask = replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth, orgHeight)
-
-		slicesCache[pos] = slices
-		gtMaskCache[pos] = gtMask
-		projMatrixCache[pos] = proj
-
-	def evict_old_frames(centerPos):
-		for pos in list(slicesCache.keys()):
-			if pos < centerPos - TEMPORAL_WINDOW:
-				del slicesCache[pos]
-				del gtMaskCache[pos]
-				del projMatrixCache[pos]
-				del orgImageCache[pos]
-
-	# process each frame:
+	# render slices:
 	# ---------------
-	for centerPos in range(total):
-		fi = frameIndices[centerPos]
-		print(f'\n--- Processing frame {fi} ({centerPos+1}/{total}) ---\n')
+	print('Rendering slices...')
 
-		windowStart = max(0, centerPos - TEMPORAL_WINDOW)
-		windowEnd   = min(total - 1, centerPos + TEMPORAL_WINDOW)
+	slices = []
+	for i in range(NUM_SLICES):
+		with torch.no_grad():
+			render = ddgs.render(
+				settings,
+				*get_slice(gaussians, zMin, zMax, i)
+			)
 
-		# load each frame needed for smoothing
-		for pos in range(windowStart, windowEnd + 1):
-			load_frame(pos)
+		img = torch.cat([render.color, render.alpha], dim=-1)
+		img = (img * 255).to(torch.uint8)
 
-		# build smoothing list, exclude frames with high motion
-		centerImg = orgImageCache[centerPos]
-		windowSlices  = []
-		windowGtMasks = []
-		excluded = 0
-		highMotion = False
-		for pos in range(windowStart, windowEnd + 1):
-			if pos == centerPos:
-				windowSlices.append(slicesCache[pos])
-				windowGtMasks.append(gtMaskCache[pos])
-			else:
-				score = compute_motion_score(centerImg, orgImageCache[pos])
-				if score <= MOTION_THRESHOLD:
-					windowSlices.append(slicesCache[pos])
-					windowGtMasks.append(gtMaskCache[pos])
-				else:
-					excluded += 1
-					highMotion = True
-					print(f'Excluding frame pos={pos} from temporal smoothing (score={score:.1f} > threshold={MOTION_THRESHOLD})')
+		render.depth[render.depth > zMax] = zMax
+		render.depth[(render.depth < zMin) & (render.depth > 0)] = zMin
 
-		centerInWindow = sum(
-			1 for pos in range(windowStart, centerPos)
-			if compute_motion_score(centerImg, orgImageCache[pos]) <= MOTION_THRESHOLD
+		sliceT   = (slice_t(i) + slice_t(i + 1)) * 0.5
+		slicePos = sliceT * (zMax - zMin) + zMin
+
+		slices.append([img, render.depth, slicePos])
+
+	# replace with GT:
+	# ---------------
+	print('Replacing renders with GT color...')
+
+	slices, gtMasks = replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth, orgHeight)
+
+	# generate block atlas:
+	# ---------------
+	needsMaskAtlas = outStereoImages is not None and any(maskPath is not None for (_, _, maskPath) in outStereoImages)
+
+	if greedy:
+		atlas, placements, maskAtlas = generate_block_atlas_greedy(
+			slices,
+			gtMasks=gtMasks if needsMaskAtlas else None
 		)
-
-		# generate block atlas
-		slices = slicesCache[centerPos]
-		gtMasks = gtMaskCache[centerPos]
-
-		outStereoImages = outStereoImagesFn(fi) if outStereoImagesFn else None
-		needsMaskAtlas = outStereoImages is not None and any(maskPath is not None for (_, _, maskPath) in outStereoImages)
-
-		atlas, placements, maskAtlas = generate_block_atlas_fast(
+	else:
+		atlas, placements, maskAtlas = generate_block_atlas(
 			slices,
 			gtMasks=gtMasks if needsMaskAtlas else None
 		)
 
-		# build geometry (returns raw zGrid before smoothing)
-		proj = projMatrixCache[centerPos]
-		focal = float(proj[1, 1].item() * outfilledHeight / 2)
+	# build geometry:
+	# ---------------
+	focal = float(proj[1, 1].item() * outfilledHeight / 2)
 
-		print("Building raw depth grid...")
-		zGrid, GW, GH = build_geometry(
-			placements, slices,
-			outfilledWidth, outfilledHeight,
-			focal, aspect
-		)
-
-		# temporal smoothing (depth)
-		# print("Applying temporal depth smoothing...")
-
-		# smoothedZGrid = zGrid if highMotion else apply_depth_smoothing(zGrid, depthHistory)
-		smoothedZGrid = zGrid
-
-		# finish geometry from smoothed zGrid
-		positions, uvs, indices = finish_geometry(
-			smoothedZGrid, placements,
-			outfilledWidth, outfilledHeight,
-			focal, aspect
-		)
-
-		atlasCpu     = atlas.cpu().numpy()
-		maskAtlasCpu = maskAtlas.cpu().numpy() if maskAtlas is not None else None
-		positionsCpu = positions.cpu().numpy()
-		uvsCpu       = uvs.cpu().numpy()
-		indicesCpu   = indices.cpu().numpy()
-
-		# save GLB
-		outGLB = outGLBFn(fi) if outGLBFn else None
-		if outGLB is not None:
-			print(f'Writing GLB to {outGLB}...')
-			exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
-
-		# render stereo images
-		if outStereoImages is not None:
-			up = torch.tensor([0.0, 1.0, 0.0])
-			scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight), centerImg)
-
-			maskScene = None
-			if maskAtlasCpu is not None:
-				maskScene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, maskAtlasCpu, (orgWidth, orgHeight))
-
-			try:
-				fovRender = 2 * math.atan(orgHeight / (2 * focal))
-				projRender = perspective(fovRender, outfilledWidth / outfilledHeight, 0.1, 1000.0)
-
-				viewData = []
-				for entry in outStereoImages:
-					ipd, path, maskPath = entry
-
-					eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
-					targetLeft = torch.tensor([ ipd / 2, 0.0, 1.0])
-					viewLeft   = look_at(eyeLeft, targetLeft, up)
-
-					eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
-					targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
-					viewRight   = look_at(eyeRight, targetRight, up)
-
-					imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
-					imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), projRender.cpu().numpy())
-
-					stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
-					stereo.paste(imgLeft,  (0, 0))
-					stereo.paste(imgRight, (orgWidth, 0))
-
-					maskStereo = None
-					if maskPath is not None and maskScene is not None:
-						maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
-						maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), projRender.cpu().numpy())
-
-						maskLeft  = maskLeft.convert('L')
-						maskRight = maskRight.convert('L')
-						
-						maskStereo = Image.new('L', (orgWidth * 2, orgHeight))
-						maskStereo.paste(maskLeft,  (0, 0))
-						maskStereo.paste(maskRight, (orgWidth, 0))
-
-					viewData.append((path, stereo, maskPath, maskStereo))
-
-				def save_entry(args):
-					path, stereo, maskPath, maskStereo = args
-
-					print(f'Saving stereo render: {path}...')
-					
-					stereo.save(path, compress_level=1)
-					if maskPath is not None and maskStereo is not None:
-						print(f'Saving stereo mask: {maskPath}...')
-					
-						maskStereo.save(maskPath, compress_level=1)
-
-				from concurrent.futures import ThreadPoolExecutor
-				with ThreadPoolExecutor() as executor:
-					list(executor.map(save_entry, viewData))
-
-			finally:
-				renderer.release_scene(scene)
-				if maskScene is not None:
-					renderer.release_scene(maskScene)
-
-		evict_old_frames(centerPos)
-
-def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages):
-	spatial_photo_sequence(
-	    frameIndices=range(1),
-	    orgImagePathFn =lambda i: orgImagePath,
-	    plyPathFn      =lambda i: plyPath,
-	    outGLBFn       =lambda i: outGLB,
-	    outStereoImagesFn=lambda i: outStereoImages
+	print('Building depth grid...')
+	zGrid, GW, GH = build_geometry(
+		placements, slices,
+		outfilledWidth, outfilledHeight,
+		focal, aspect
 	)
+
+	positions, uvs, indices = finish_geometry(
+		zGrid, placements,
+		outfilledWidth, outfilledHeight,
+		focal, aspect
+	)
+
+	atlasCpu     = atlas.cpu().numpy()
+	maskAtlasCpu = maskAtlas.cpu().numpy() if maskAtlas is not None else None
+	positionsCpu = positions.cpu().numpy()
+	uvsCpu       = uvs.cpu().numpy()
+	indicesCpu   = indices.cpu().numpy()
+
+	# save GLB:
+	# ---------------
+	if outGLB is not None:
+		print(f'Writing GLB to {outGLB}...')
+		exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
+
+	# render stereo images:
+	# ---------------
+	if outStereoImages is not None:
+		up    = torch.tensor([0.0, 1.0, 0.0])
+		scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight), orgImage.convert('RGB'))
+
+		maskScene = None
+		if maskAtlasCpu is not None:
+			maskScene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, maskAtlasCpu, (orgWidth, orgHeight))
+
+		try:
+			fovRender  = 2 * math.atan(orgHeight / (2 * focal))
+			projRender = perspective(fovRender, outfilledWidth / outfilledHeight, 0.1, 1000.0)
+
+			viewData = []
+			for entry in outStereoImages:
+				ipd, path, maskPath = entry
+
+				eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
+				targetLeft = torch.tensor([ ipd / 2, 0.0, 1.0])
+				viewLeft   = look_at(eyeLeft, targetLeft, up)
+
+				eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
+				targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
+				viewRight   = look_at(eyeRight, targetRight, up)
+
+				imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+				imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+
+				stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
+				stereo.paste(imgLeft,  (0, 0))
+				stereo.paste(imgRight, (orgWidth, 0))
+
+				maskStereo = None
+				if maskPath is not None and maskScene is not None:
+					maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+					maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+
+					maskLeft  = maskLeft.convert('L')
+					maskRight = maskRight.convert('L')
+
+					maskStereo = Image.new('L', (orgWidth * 2, orgHeight))
+					maskStereo.paste(maskLeft,  (0, 0))
+					maskStereo.paste(maskRight, (orgWidth, 0))
+
+				viewData.append((path, stereo, maskPath, maskStereo))
+
+			def save_entry(args):
+				path, stereo, maskPath, maskStereo = args
+
+				print(f'Saving stereo render: {path}...')
+				stereo.save(path, compress_level=1)
+
+				if maskPath is not None and maskStereo is not None:
+					print(f'Saving stereo mask: {maskPath}...')
+					maskStereo.save(maskPath, compress_level=1)
+
+			from concurrent.futures import ThreadPoolExecutor
+			with ThreadPoolExecutor() as executor:
+				list(executor.map(save_entry, viewData))
+
+		finally:
+			renderer.release_scene(scene)
+			if maskScene is not None:
+				renderer.release_scene(maskScene)
 
 # ------------------------------------------- #
 
 if __name__ == "__main__":
 	import argparse
-	import glob
 	import re
 
 	# setup argparse:
 	# ---------------
 	parser = argparse.ArgumentParser(description="Generate spatial photos / stereo image sequences from ML-Sharp outputs")
 
-	parser.add_argument("input", help=(
-		"Either a single source image (e.g. photo.png) or a directory containing "
-		"'frames/' and 'plys/' subdirectories for sequence mode."
-	))
+	parser.add_argument("img", help="Source image file, or a directory containing 'frames/' and 'plys/' subdirectories for sequence mode.")
+	parser.add_argument("ply", nargs="?", default=None, help="PLY file (single file mode only; inferred from img path if omitted).")
 
-	parser.add_argument("--start", type=int, default=None, help="First frame index to process (sequence mode only).")
+	parser.add_argument("--start", type=int, default=None, help="First frame index to process, inclusive (sequence mode only).")
 	parser.add_argument("--end",   type=int, default=None, help="Last frame index to process, inclusive (sequence mode only).")
-	parser.add_argument("--frame-digits", type=int, default=3, help="Zero-padding width for frame filenames, e.g. 3 → frame_001.png (default: 3).")
-	parser.add_argument("--frame-prefix", type=str, default="frame_", help="Filename prefix for frame/ply files (default: 'frame_').")
-
-	parser.add_argument("--ply", type=str, default=None, help="Path to PLY file (single file mode only; inferred from input path otherwise).")
 
 	parser.add_argument("--out-glb",    type=str, default=None, help="Output GLB path or directory (sequence mode writes per-frame GLBs here).")
 	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo image path or directory.")
 	parser.add_argument("--out-mask",   type=str, default=None, help="Output stereo mask image path or directory (requires --out-stereo).")
-	parser.add_argument("--ipd", type=int, nargs="+", default=[64], metavar="MM",
-		help="One or more interpupillary distances in millimetres (default: 64). Each IPD is rendered into its own ipd_NNN subdirectory.")
+	parser.add_argument("--ipd", type=int, nargs="+", default=[56], metavar="MM",
+		help="One or more interpupillary distances in millimetres (default: 56). Each IPD is rendered into its own ipd_NNN subdirectory.")
+	parser.add_argument("--greedy", action="store_true",
+		help="Use greedy-meshed atlas packing instead of the default square atlas.")
+	parser.add_argument("--resume", action="store_true",
+		help="Skip frames whose output files already exist on disk.")
 
 	args = parser.parse_args()
 
-	# get paths:
-	# ---------------
-	inputPath = args.input
-	isDir = os.path.isdir(inputPath)
-
-	def out_path(base, fi, digits, prefix, ext):
-		os.makedirs(base, exist_ok=True)
-		return os.path.join(base, f"{prefix}{fi:0{digits}d}{ext}")
-
 	# sequence mode:
 	# ---------------
-	if isDir:
-		framesDir = os.path.join(inputPath, "frames")
-		plysDir   = os.path.join(inputPath, "plys")
+	if os.path.isdir(args.img):
+		inputDir  = args.img
+		framesDir = os.path.join(inputDir, "frames")
+		plysDir   = os.path.join(inputDir, "plys")
 
 		if not os.path.isdir(framesDir):
-			parser.error(f"Expected a 'frames/' subdirectory inside '{inputPath}'.")
+			parser.error(f"Expected a 'frames/' subdirectory inside '{inputDir}'.")
 		if not os.path.isdir(plysDir):
-			parser.error(f"Expected a 'plys/' subdirectory inside '{inputPath}'.")
+			parser.error(f"Expected a 'plys/' subdirectory inside '{inputDir}'.")
 
-		digits = args.frame_digits
-		prefix = args.frame_prefix
+		IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}
 
-		pattern = re.compile(rf"^{re.escape(prefix)}(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
-		available = sorted(
-			int(m.group(1))
-			for f in os.listdir(framesDir)
-			if (m := pattern.match(f))
+		frameFiles = sorted(
+			f for f in os.listdir(framesDir)
+			if os.path.splitext(f)[1].lower() in IMAGE_EXTS
 		)
 
-		if not available:
-			parser.error(f"No frame files matching '{prefix}<N>.png/jpg' found in '{framesDir}'.")
+		if not frameFiles:
+			parser.error(f"No image files found in '{framesDir}'.")
 
-		start = args.start if args.start is not None else available[0]
-		end   = args.end   if args.end   is not None else available[-1]
+		if args.start is not None:
+			frameFiles = frameFiles[args.start:]
+		if args.end is not None:
+			frameFiles = frameFiles[:args.end - (args.start or 0) + 1]
 
-		frameIndices = [i for i in available if start <= i <= end]
-		if not frameIndices:
-			parser.error(f"No frames found in the range [{start}, {end}].")
+		if not frameFiles:
+			parser.error(f"No frames remain after applying --start/--end range.")
 
-		def frame_ext(fi):
-			for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
-				p = os.path.join(framesDir, f"{prefix}{fi:0{digits}d}{ext}")
-				if os.path.exists(p):
-					return ext
-			return ".png"
+		for i, frameFile in enumerate(frameFiles):
+			stem = os.path.splitext(frameFile)[0]
+			orgImagePath = os.path.join(framesDir, frameFile)
+			plyPath      = os.path.join(plysDir, stem + ".ply")
 
-		spatial_photo_sequence(
-			frameIndices     = frameIndices,
-			orgImagePathFn   = lambda i: os.path.join(framesDir, f"{prefix}{i:0{digits}d}{frame_ext(i)}"),
-			plyPathFn        = lambda i: os.path.join(plysDir,   f"{prefix}{i:0{digits}d}.ply"),
-			outGLBFn         = (lambda i: out_path(args.out_glb,    i, digits, prefix, ".glb")) if args.out_glb    else None,
-			outStereoImagesFn= (lambda i: [
-				(
-					ipdMM / 1000.0,
-					out_path(os.path.join(args.out_stereo, f"ipd_{ipdMM:03d}"), i, digits, prefix, ".png"),
-					out_path(os.path.join(args.out_mask,   f"ipd_{ipdMM:03d}"), i, digits, prefix, ".png") if args.out_mask else None,
-				)
-				for ipdMM in args.ipd
-			]) if args.out_stereo else None,
-		)
+			if not os.path.isfile(plyPath):
+				print(f"Warning: PLY not found for '{frameFile}', skipping.")
+				continue
+
+			print(f'\n--- Processing {frameFile} ({i + 1}/{len(frameFiles)}) ---\n')
+
+			def out_path(base, ext):
+				os.makedirs(base, exist_ok=True)
+				return os.path.join(base, stem + ext)
+
+			outGLB = out_path(args.out_glb, ".glb") if args.out_glb else None
+
+			outStereoImages = None
+			if args.out_stereo:
+				outStereoImages = [
+					(
+						ipdMM / 1000.0,
+						out_path(os.path.join(args.out_stereo, f"ipd_{ipdMM:03d}"), ".png"),
+						out_path(os.path.join(args.out_mask,   f"ipd_{ipdMM:03d}"), ".png") if args.out_mask else None,
+					)
+					for ipdMM in args.ipd
+				]
+
+			spatial_photo(
+				orgImagePath    = orgImagePath,
+				plyPath         = plyPath,
+				outGLB          = outGLB,
+				outStereoImages = outStereoImages,
+				greedy          = args.greedy,
+				skipExisting    = args.resume,
+			)
 
 	# single file mode:
 	# ---------------
 	else:
-		if not os.path.isfile(inputPath):
-			parser.error(f"'{inputPath}' is not a file or directory.")
+		if not os.path.isfile(args.img):
+			parser.error(f"'{args.img}' is not a file or directory.")
 
-		base, imgExt = os.path.splitext(inputPath)
-		plyPath = args.ply if args.ply else base + ".ply"
+		plyPath = args.ply if args.ply else os.path.splitext(args.img)[0] + ".ply"
 
 		if not os.path.isfile(plyPath):
-			parser.error(f"PLY file not found: '{plyPath}'. Use --ply to specify its path.")
+			parser.error(f"PLY file not found: '{plyPath}'. Pass it as a positional argument.")
 
-		stereoBase = args.out_stereo if args.out_stereo else os.path.splitext(inputPath)[0] + "_stereo"
-		maskBase   = args.out_mask   if args.out_mask   else None
+		base       = os.path.splitext(args.img)[0]
+		stereoBase = args.out_stereo if args.out_stereo else base + "_stereo"
+		maskBase   = args.out_mask
 
 		def single_stereo_entry(ipdMM):
 			stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
@@ -1073,8 +937,10 @@ if __name__ == "__main__":
 			return (ipdMM / 1000.0, stereoOut, maskOut)
 
 		spatial_photo(
-			orgImagePath    = inputPath,
+			orgImagePath    = args.img,
 			plyPath         = plyPath,
 			outGLB          = args.out_glb,
 			outStereoImages = [single_stereo_entry(ipdMM) for ipdMM in args.ipd],
+			greedy          = args.greedy,
+			skipExisting    = args.resume,
 		)
