@@ -11,6 +11,7 @@ import imageio.v2 as imageio
 from PIL import Image
 from tqdm import tqdm
 from plyfile import PlyData
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import renderer
 import exporter
@@ -194,8 +195,6 @@ def generate_block_atlas(slices, gtMasks=None):
 
 	# collect present blocks:
 	# ---------------
-	print("Collecting present blocks...")
-
 	meta = []
 	for idx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
@@ -229,8 +228,6 @@ def generate_block_atlas(slices, gtMasks=None):
 
 	# pack atlas:
 	# ---------------
-	print("Packing slices into atlas... ")
-
 	placements = []
 
 	for i, (sliceIdx, srcPx, srcPy) in enumerate(meta):
@@ -264,8 +261,6 @@ def generate_block_atlas_greedy(slices, gtMasks=None):
 
 	# greedy mesh each slice:
 	# ---------------
-	print("Greedy meshing slices...")
-
 	for idx, (img, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // BLOCK_SIZE, W // BLOCK_SIZE
@@ -291,8 +286,6 @@ def generate_block_atlas_greedy(slices, gtMasks=None):
 
 	# pack greedy meshed rects:
 	# ---------------
-	print("Packing slices into atlas... ")
-
 	packer = pack_blocks(mergedDims)
 
 	bin0 = packer.bin_list()[0]
@@ -448,14 +441,10 @@ def build_geometry(placements, slices, width, height, focal, aspect):
 
 	# infill depth for each block:
 	# ---------------
-	print("Filling block depths...")
-
 	blockDepths = fill_block_depths(placements, slices)
 
 	# average depth at corners, enforce monotonicity:
 	# ---------------
-	print("Computing vertex depths...")
-
 	S  = NUM_SLICES
 	GW = width  // BLOCK_SIZE
 	GH = height // BLOCK_SIZE
@@ -513,8 +502,6 @@ def finish_geometry(zGrid, placements, width, height, focal, aspect):
 
 	# compute worldspace vertex coordinates:
 	# ---------------
-	print("Computing vertex coordinates...")
-
 	gxCoords = torch.arange(GW + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
 	gyCoords = torch.arange(GH + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
 
@@ -529,8 +516,6 @@ def finish_geometry(zGrid, placements, width, height, focal, aspect):
 
 	# compute positions and uvs:
 	# ---------------
-	print("Building vertex buffers...")
-
 	plSiceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long,   device='cuda')
 	plPx      = torch.tensor([p[1] for p in placements], dtype=torch.long,   device='cuda')
 	plPy      = torch.tensor([p[2] for p in placements], dtype=torch.long,   device='cuda')
@@ -615,9 +600,68 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 
 	return slices, gtMask
 
+def render_stereo_views(positions, uvs, indices, atlasCpu, maskAtlasCpu,
+                         orgImage, orgWidth, orgHeight, outfilledWidth, outfilledHeight,
+                         focal, outStereoImages):
+
+	up    = torch.tensor([0.0, 1.0, 0.0])
+	scene = renderer.upload_scene(positions, uvs, indices, atlasCpu, (orgWidth, orgHeight), orgImage.convert('RGB'))
+
+	maskScene = None
+	if maskAtlasCpu is not None:
+		maskScene = renderer.upload_scene(positions, uvs, indices, maskAtlasCpu, (orgWidth, orgHeight))
+
+	fovRender  = 2 * math.atan(orgHeight / (2 * focal))
+	projRender = perspective(fovRender, outfilledWidth / outfilledHeight, 0.1, 1000.0)
+
+	viewData = []
+	for ipd, path, maskPath in outStereoImages:
+		eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
+		targetLeft = torch.tensor([ ipd / 2, 0.0, 1.0])
+		viewLeft   = look_at(eyeLeft, targetLeft, up)
+
+		eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
+		targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
+		viewRight   = look_at(eyeRight, targetRight, up)
+
+		imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+		imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+
+		stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
+		stereo.paste(imgLeft,  (0, 0))
+		stereo.paste(imgRight, (orgWidth, 0))
+
+		maskStereo = None
+		if maskPath is not None and maskScene is not None:
+			maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
+			maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+
+			maskLeft  = maskLeft.convert('L')
+			maskRight = maskRight.convert('L')
+
+			maskStereo = Image.new('L', (orgWidth * 2, orgHeight))
+			maskStereo.paste(maskLeft,  (0, 0))
+			maskStereo.paste(maskRight, (orgWidth, 0))
+
+		viewData.append((path, stereo, maskPath, maskStereo))
+
+	return viewData, scene, maskScene
+
+def save_outputs(outGLB, glbData, viewData):
+	if outGLB is not None:
+		atlasCpu, positionsCpu, uvsCpu, indicesCpu = glbData
+		exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
+
+	for path, stereo, maskPath, maskStereo in viewData:
+		stereo.save(path, compress_level=1)
+
+		if maskPath is not None and maskStereo is not None:
+			maskStereo.save(maskPath, compress_level=1)
+
 # ------------------------------------------- #
 
-def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, skipExisting=False):
+def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, skipExisting=False,
+                  saveFuture=None, saveExecutor=None):
 
 	torch.set_default_device('cuda')
 
@@ -636,7 +680,7 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 
 		if paths and all(os.path.isfile(p) for p in paths):
 			print('Skipping: all outputs already exist.')
-			return
+			return None
 
 	# get dimensions:
 	# ---------------
@@ -705,6 +749,8 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 
 	# generate block atlas:
 	# ---------------
+	print('Generating block atlas...')
+
 	needsMaskAtlas = outStereoImages is not None and any(maskPath is not None for (_, _, maskPath) in outStereoImages)
 
 	if greedy:
@@ -720,14 +766,19 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 
 	# build geometry:
 	# ---------------
+	print('Building geometry...')
+
 	focal = float(proj[1, 1].item() * outfilledHeight / 2)
 
-	print('Building depth grid...')
 	zGrid, GW, GH = build_geometry(
 		placements, slices,
 		outfilledWidth, outfilledHeight,
 		focal, aspect
 	)
+
+	# compute render buffers:
+	# ---------------
+	print('Computing render buffers...')
 
 	positions, uvs, indices = finish_geometry(
 		zGrid, placements,
@@ -741,77 +792,53 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 	uvsCpu       = uvs.cpu().numpy()
 	indicesCpu   = indices.cpu().numpy()
 
-	# save GLB:
+	# render stereo views:
 	# ---------------
-	if outGLB is not None:
-		print(f'Writing GLB to {outGLB}...')
-		exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
-
-	# render stereo images:
-	# ---------------
+	viewData = []
 	if outStereoImages is not None:
-		up    = torch.tensor([0.0, 1.0, 0.0])
-		scene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, atlasCpu, (orgWidth, orgHeight), orgImage.convert('RGB'))
+		print('Rendering stereo views...')
 
-		maskScene = None
-		if maskAtlasCpu is not None:
-			maskScene = renderer.upload_scene(positionsCpu, uvsCpu, indicesCpu, maskAtlasCpu, (orgWidth, orgHeight))
+		viewData, scene, maskScene = render_stereo_views(
+			positionsCpu, uvsCpu, indicesCpu, atlasCpu, maskAtlasCpu,
+			orgImage, orgWidth, orgHeight, outfilledWidth, outfilledHeight,
+			focal, outStereoImages
+		)
 
-		try:
-			fovRender  = 2 * math.atan(orgHeight / (2 * focal))
-			projRender = perspective(fovRender, outfilledWidth / outfilledHeight, 0.1, 1000.0)
+		renderer.release_scene(scene)
+		if maskScene is not None:
+			renderer.release_scene(maskScene)
 
-			viewData = []
-			for entry in outStereoImages:
-				ipd, path, maskPath = entry
+	# dispatch saving on background thread:
+	# ---------------
+	print('Saving outputs...')
+	if outGLB is not None:
+		print(f'    - GLB: {outGLB}')
+	if viewData:
+		for path, _, maskPath, _ in viewData:
+			print(f'    - Stereo render: {path}')
+			if maskPath is not None:
+				print(f'    - Stereo mask render: {maskPath}')
 
-				eyeLeft    = torch.tensor([ ipd / 2, 0.0, 0.0])
-				targetLeft = torch.tensor([ ipd / 2, 0.0, 1.0])
-				viewLeft   = look_at(eyeLeft, targetLeft, up)
+	glbData = (atlasCpu, positionsCpu, uvsCpu, indicesCpu) if outGLB is not None else None
+	if glbData is None and not viewData:
+		return None
 
-				eyeRight    = torch.tensor([-ipd / 2, 0.0, 0.0])
-				targetRight = torch.tensor([-ipd / 2, 0.0, 1.0])
-				viewRight   = look_at(eyeRight, targetRight, up)
+	if saveFuture is not None:
+		saveFuture.result()
 
-				imgLeft  = renderer.render_view(scene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
-				imgRight = renderer.render_view(scene, viewRight.cpu().numpy(), projRender.cpu().numpy())
+	ownExecutor = saveExecutor is None
+	executor    = saveExecutor or ThreadPoolExecutor(max_workers=1)
+	try:
+		newFuture = executor.submit(save_outputs, outGLB, glbData, viewData)
+		if ownExecutor:
+			newFuture.result()
+			newFuture = None
 
-				stereo = Image.new(imgLeft.mode, (orgWidth * 2, orgHeight))
-				stereo.paste(imgLeft,  (0, 0))
-				stereo.paste(imgRight, (orgWidth, 0))
+	finally:
+		if ownExecutor:
+			executor.shutdown(wait=False)
 
-				maskStereo = None
-				if maskPath is not None and maskScene is not None:
-					maskLeft  = renderer.render_view(maskScene, viewLeft.cpu().numpy(),  projRender.cpu().numpy())
-					maskRight = renderer.render_view(maskScene, viewRight.cpu().numpy(), projRender.cpu().numpy())
-
-					maskLeft  = maskLeft.convert('L')
-					maskRight = maskRight.convert('L')
-
-					maskStereo = Image.new('L', (orgWidth * 2, orgHeight))
-					maskStereo.paste(maskLeft,  (0, 0))
-					maskStereo.paste(maskRight, (orgWidth, 0))
-
-				viewData.append((path, stereo, maskPath, maskStereo))
-
-			def save_entry(args):
-				path, stereo, maskPath, maskStereo = args
-
-				print(f'Saving stereo render: {path}...')
-				stereo.save(path, compress_level=1)
-
-				if maskPath is not None and maskStereo is not None:
-					print(f'Saving stereo mask: {maskPath}...')
-					maskStereo.save(maskPath, compress_level=1)
-
-			from concurrent.futures import ThreadPoolExecutor
-			with ThreadPoolExecutor() as executor:
-				list(executor.map(save_entry, viewData))
-
-		finally:
-			renderer.release_scene(scene)
-			if maskScene is not None:
-				renderer.release_scene(maskScene)
+	return newFuture
 
 # ------------------------------------------- #
 
@@ -854,7 +881,6 @@ if __name__ == "__main__":
 			parser.error(f"Expected a 'plys/' subdirectory inside '{inputDir}'.")
 
 		IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}
-
 		frameFiles = sorted(
 			f for f in os.listdir(framesDir)
 			if os.path.splitext(f)[1].lower() in IMAGE_EXTS
@@ -871,42 +897,60 @@ if __name__ == "__main__":
 		if not frameFiles:
 			parser.error(f"No frames remain after applying --start/--end range.")
 
-		for i, frameFile in enumerate(frameFiles):
-			stem = os.path.splitext(frameFile)[0]
-			orgImagePath = os.path.join(framesDir, frameFile)
-			plyPath      = os.path.join(plysDir, stem + ".ply")
+		with ThreadPoolExecutor(max_workers=1) as saveExecutor:
+			failedFiles = []
+			pendingSave = None
 
-			if not os.path.isfile(plyPath):
-				print(f"Warning: PLY not found for '{frameFile}', skipping.")
-				continue
+			for i, frameFile in enumerate(frameFiles):
+				stem = os.path.splitext(frameFile)[0]
+				orgImagePath = os.path.join(framesDir, frameFile)
+				plyPath      = os.path.join(plysDir, stem + ".ply")
 
-			print(f'\n--- Processing {frameFile} ({i + 1}/{len(frameFiles)}) ---\n')
+				if not os.path.isfile(plyPath):
+					print(f"Warning: PLY not found for '{frameFile}', skipping.")
+					failedFiles.append(frameFile)
 
-			def out_path(base, ext):
-				os.makedirs(base, exist_ok=True)
-				return os.path.join(base, stem + ext)
+					continue
 
-			outGLB = out_path(args.out_glb, ".glb") if args.out_glb else None
+				print(f'\n--- Processing {frameFile} ({i + 1}/{len(frameFiles)}) ---\n')
 
-			outStereoImages = None
-			if args.out_stereo:
-				outStereoImages = [
-					(
-						ipdMM / 1000.0,
-						out_path(os.path.join(args.out_stereo, f"ipd_{ipdMM:03d}"), ".png"),
-						out_path(os.path.join(args.out_mask,   f"ipd_{ipdMM:03d}"), ".png") if args.out_mask else None,
+				def out_path(base, ext):
+					os.makedirs(base, exist_ok=True)
+					return os.path.join(base, stem + ext)
+
+				outGLB = out_path(args.out_glb, ".glb") if args.out_glb else None
+				outStereoImages = None
+				if args.out_stereo:
+					outStereoImages = [
+						(
+							ipdMM / 1000.0,
+							out_path(os.path.join(args.out_stereo, f"ipd_{ipdMM:03d}"), ".png"),
+							out_path(os.path.join(args.out_mask,   f"ipd_{ipdMM:03d}"), ".png") if args.out_mask else None,
+						)
+						for ipdMM in args.ipd
+					]
+
+				try:
+					pendingSave = spatial_photo(
+						orgImagePath    = orgImagePath,
+						plyPath         = plyPath,
+						outGLB          = outGLB,
+						outStereoImages = outStereoImages,
+						greedy          = args.greedy,
+						skipExisting    = args.resume,
+						saveFuture      = pendingSave,
+						saveExecutor    = saveExecutor,
 					)
-					for ipdMM in args.ipd
-				]
+				except Exception as e:
+					print(f'Failed with exception: {e}')
+					failedFiles.append(frameFile)
 
-			spatial_photo(
-				orgImagePath    = orgImagePath,
-				plyPath         = plyPath,
-				outGLB          = outGLB,
-				outStereoImages = outStereoImages,
-				greedy          = args.greedy,
-				skipExisting    = args.resume,
-			)
+			if pendingSave is not None:
+				pendingSave.result()
+
+			print('\n--- Finished Processing ---\n')
+			if failedFiles:
+				print(f'Processing failed on entries: {failedFiles}')
 
 	# single file mode:
 	# ---------------
