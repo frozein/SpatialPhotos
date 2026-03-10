@@ -112,12 +112,14 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 		viewRight   = look_at(eyeRight, targetRight, up)
 
 		settingsLeft = ddgs.Settings(view=viewLeft, **settings_base)
-		renderLeft   = ddgs.render(settingsLeft, *gaussians)
+		with torch.no_grad():
+			renderLeft = ddgs.render(settingsLeft, *gaussians)
 		imgLeft = (renderLeft.color * 255).to(torch.uint8)
 		imgLeft  = torch.flip(imgLeft,  dims=[1])
 
 		settingsRight = ddgs.Settings(view=viewRight, **settings_base)
-		renderRight   = ddgs.render(settingsRight, *gaussians)
+		with torch.no_grad():
+			renderRight = ddgs.render(settingsRight, *gaussians)
 		imgRight = (renderRight.color * 255).to(torch.uint8)
 		imgRight = torch.flip(imgRight, dims=[1])
 
