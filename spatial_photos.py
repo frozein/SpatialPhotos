@@ -189,7 +189,7 @@ def pack_blocks(mergedBlockDims):
 
 	return finalPacker
 
-def generate_block_atlas(slices, gtMasks=None):
+def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 
 	B = BLOCK_SIZE
 
@@ -203,7 +203,8 @@ def generate_block_atlas(slices, gtMasks=None):
 		alpha = img[:GH*B, :GW*B, 3]
 		alpha = alpha.reshape(GH, B, GW, B)
 
-		present = (alpha >= ALPHA_THRESHOLD).any(dim=1).any(dim=2)
+		threshold = ALPHA_SOLID_THRESHOLD if opaqueOnly else ALPHA_THRESHOLD
+		present = (alpha >= threshold).any(dim=1).any(dim=2)
 
 		gyIdx, gxIdx = present.nonzero(as_tuple=True)
 		for gy, gx in zip(gyIdx.tolist(), gxIdx.tolist()):
@@ -250,25 +251,40 @@ def generate_block_atlas(slices, gtMasks=None):
 
 		placements.append((sliceIdx, srcPx, srcPy, u0, v1, u1, v0))
 
+	if opaqueOnly:
+		opaque = atlas[..., 3] >= ALPHA_SOLID_THRESHOLD
+
+		alpha = atlas[..., 3:4].float() / 255.0
+		nonzero = alpha > 0
+		mask = opaque.unsqueeze(-1) & nonzero 
+		atlas[..., :3] = torch.where(
+			mask,
+			(atlas[..., :3].float() / alpha).clamp(0, 255),
+			atlas[..., :3]
+		).to(atlas.dtype)
+
+		atlas[..., 3] = opaque.to(atlas.dtype) * 255
+
 	if maskAtlas is not None:
 		maskAtlas[..., 3] = atlas[..., 3]
 
 	return atlas, placements, maskAtlas
 
-def generate_block_atlas_greedy(slices, gtMasks=None):
+def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 	mergedMeta = []
 	mergedDims = []
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, _) in enumerate(slices):
+	for idx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // BLOCK_SIZE, W // BLOCK_SIZE
 
 		alpha = img[:GH*BLOCK_SIZE, :GW*BLOCK_SIZE, 3]
 		alpha = alpha.reshape(GH, BLOCK_SIZE, GW, BLOCK_SIZE)
 
-		present = (alpha >= ALPHA_THRESHOLD).any(dim=1).any(dim=2)
+		threshold = ALPHA_SOLID_THRESHOLD if opaqueOnly else ALPHA_THRESHOLD
+		present = (alpha >= threshold).any(dim=1).any(dim=2)
 		presentCpu = present.cpu().numpy()
 
 		if not np.any(presentCpu):
@@ -303,7 +319,7 @@ def generate_block_atlas_greedy(slices, gtMasks=None):
 		_, ax, ay, aw, ah, i = rect
 
 		sliceIdx, srcPx, srcPy, pw, ph, blockCoords = mergedMeta[i]
-		img, _ = slices[sliceIdx]
+		img, _, _ = slices[sliceIdx]
 
 		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
 		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
@@ -322,12 +338,31 @@ def generate_block_atlas_greedy(slices, gtMasks=None):
 			ox = bx - srcPx
 			oy = by - srcPy
 
-			u0 = (ax + ox + UV_PADDING) / atlasW
-			v0 = (ay + oy + UV_PADDING) / atlasH
-			u1 = (ax + ox + BLOCK_SIZE - UV_PADDING) / atlasW
-			v1 = (ay + oy + BLOCK_SIZE - UV_PADDING) / atlasH
+			padLeft  = UV_PADDING if (ox == 0)               else 0
+			padRight = UV_PADDING if (ox + BLOCK_SIZE >= pw) else 0
+			padTop   = UV_PADDING if (oy == 0)               else 0
+			padBot   = UV_PADDING if (oy + BLOCK_SIZE >= ph) else 0
+
+			u0 = (ax + ox + padLeft) / atlasW
+			v0 = (ay + oy + padTop) / atlasH
+			u1 = (ax + ox + BLOCK_SIZE - padRight) / atlasW
+			v1 = (ay + oy + BLOCK_SIZE - padBot) / atlasH
 
 			placements.append((sliceIdx, bx, by, u0, v1, u1, v0))
+
+	if opaqueOnly:
+		opaque = atlas[..., 3] >= ALPHA_SOLID_THRESHOLD
+
+		alpha = atlas[..., 3:4].float() / 255.0
+		nonzero = alpha > 0
+		mask = opaque.unsqueeze(-1) & nonzero 
+		atlas[..., :3] = torch.where(
+			mask,
+			(atlas[..., :3].float() / alpha).clamp(0, 255),
+			atlas[..., :3]
+		).to(atlas.dtype)
+
+		atlas[..., 3] = opaque.to(atlas.dtype) * 255
 
 	if maskAtlas is not None:
 		maskAtlas[..., 3] = atlas[..., 3]
@@ -660,7 +695,8 @@ def save_outputs(outGLB, glbData, viewData):
 
 # ------------------------------------------- #
 
-def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, skipExisting=False,
+def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, 
+                  greedy=False, opaqueOnly=False, skipExisting=False,
                   saveFuture=None, saveExecutor=None):
 
 	torch.set_default_device('cuda')
@@ -745,7 +781,11 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 	# ---------------
 	print('Replacing renders with GT color...')
 
-	slices, gtMasks = replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth, orgHeight)
+	slices, gtMasks = replace_gt_color(
+		slices, orgImage, 
+		outfilledWidth, outfilledHeight, orgWidth, orgHeight, 
+		opaqueOnly
+	)
 
 	# generate block atlas:
 	# ---------------
@@ -756,12 +796,14 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages, greedy=False, 
 	if greedy:
 		atlas, placements, maskAtlas = generate_block_atlas_greedy(
 			slices,
-			gtMasks=gtMasks if needsMaskAtlas else None
+			gtMasks if needsMaskAtlas else None,
+			opaqueOnly
 		)
 	else:
 		atlas, placements, maskAtlas = generate_block_atlas(
 			slices,
-			gtMasks=gtMasks if needsMaskAtlas else None
+			gtMasks if needsMaskAtlas else None,
+			opaqueOnly
 		)
 
 	# build geometry:
@@ -863,6 +905,8 @@ if __name__ == "__main__":
 		help="One or more interpupillary distances in millimetres (default: 56). Each IPD is rendered into its own ipd_NNN subdirectory.")
 	parser.add_argument("--greedy", action="store_true",
 		help="Use greedy-meshed atlas packing instead of the default square atlas.")
+	parser.add_argument("--opaque-only", action="store_true",
+		help="Whether to only include opaque pixels in the atlas.")
 	parser.add_argument("--resume", action="store_true",
 		help="Skip frames whose output files already exist on disk.")
 
@@ -937,6 +981,7 @@ if __name__ == "__main__":
 						outGLB          = outGLB,
 						outStereoImages = outStereoImages,
 						greedy          = args.greedy,
+						opaqueOnly      = args.opaque_only,
 						skipExisting    = args.resume,
 						saveFuture      = pendingSave,
 						saveExecutor    = saveExecutor,
@@ -984,7 +1029,8 @@ if __name__ == "__main__":
 			orgImagePath    = args.img,
 			plyPath         = plyPath,
 			outGLB          = args.out_glb,
-			outStereoImages = [single_stereo_entry(ipdMM) for ipdMM in args.ipd],
+			outStereoImages = [single_stereo_entry(ipdMM) for ipdMM in args.ipd] if args.out_stereo else None,
 			greedy          = args.greedy,
+			opaqueOnly      = args.opaque_only,
 			skipExisting    = args.resume,
 		)

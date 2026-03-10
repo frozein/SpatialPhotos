@@ -5,14 +5,18 @@ import base64
 
 # ------------------------------------------- #
 
+IMAGE_FORMAT = "PNG"
+
+# ------------------------------------------- #
+
 def export_glb(atlas, positions, uvs, indices, outPath):
 
-	# encode image to WEBP:
+	# encode image:
 	# ---------------
 	imgBytes = io.BytesIO()
 
 	atlasImg = Image.fromarray(atlas)
-	atlasImg.save(imgBytes, format="PNG")
+	atlasImg.save(imgBytes, format=IMAGE_FORMAT)
 	imgBytes = imgBytes.getvalue()
 
 	# define GLTF structure:
@@ -36,7 +40,7 @@ def export_glb(atlas, positions, uvs, indices, outPath):
 			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs), type="VEC2"),
 			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices.flat), type="SCALAR")
 		],
-		images=[gltf.Image(uri="data:image/png;base64," + base64.b64encode(imgBytes).decode())],
+		images=[gltf.Image(uri=f"data:image/{IMAGE_FORMAT.lower()};base64," + base64.b64encode(imgBytes).decode())],
 		textures=[gltf.Texture(source=0)],
 		materials=[gltf.Material(
 			pbrMetallicRoughness=gltf.PbrMetallicRoughness(
