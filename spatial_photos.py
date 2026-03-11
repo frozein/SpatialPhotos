@@ -783,8 +783,7 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages,
 
 	slices, gtMasks = replace_gt_color(
 		slices, orgImage, 
-		outfilledWidth, outfilledHeight, orgWidth, orgHeight, 
-		opaqueOnly
+		outfilledWidth, outfilledHeight, orgWidth, orgHeight
 	)
 
 	# generate block atlas:
