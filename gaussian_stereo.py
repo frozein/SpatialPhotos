@@ -10,13 +10,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ------------------------------------------- #
 
+DEPTH_DISOCCLUSION_THRESHOLD = 0.05
+
+# ------------------------------------------- #
+
+
 def look_at(eye, target, up):
 	f = (target - eye)
 	f = f / torch.norm(f)
 	u = up / torch.norm(up)
-	s = torch.cross(f, u, dim=0)
+	s = torch.cross(u, f, dim=0)
 	s = s / torch.norm(s)
-	u = torch.cross(s, f, dim=0)
+	u = torch.cross(f, s, dim=0)
 
 	m = torch.eye(4, dtype=torch.float32)
 	m[0, :3] = s
@@ -62,9 +67,79 @@ def load_ply(path):
 
 	return gaussians, focalY
 
-def save_stereo(stereoPath, stereo):
-	os.makedirs(os.path.dirname(os.path.abspath(stereoPath)), exist_ok=True)
-	stereo.save(stereoPath, compress_level=1)
+def save_image(path, img):
+	os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+	img.save(path, compress_level=1)
+
+# ------------------------------------------- #
+
+def combine_outputs(
+	width, height, focalX, focalY,
+	viewSource, viewNovel,
+	colorSource, colorNovel,
+	depthSource, depthNovel,
+	eyeSide='right'
+):
+	cx = width  / 2.0
+	cy = height / 2.0
+
+	# transform novel -> source:
+	# ---------------
+	u = torch.arange(width,  dtype=torch.float32, device='cuda')
+	v = torch.arange(height, dtype=torch.float32, device='cuda')
+	uu, vv = torch.meshgrid(u, v, indexing='xy')
+
+	z = depthNovel
+	x = (uu - cx) / focalX * z
+	y = (vv - cy) / focalY * z
+	ones = torch.ones_like(z)
+
+	ptsNovel = torch.stack([x, y, z, ones], dim=0).reshape(4, -1)
+
+	novelToSource = viewSource @ torch.inverse(viewNovel)
+	ptrSorce = novelToSource @ ptsNovel
+
+	xSrc = ptrSorce[0]
+	ySrc = ptrSorce[1]
+	zSrc = ptrSorce[2]
+	zSrcSafe = zSrc.abs().clamp(min=1e-6)
+
+	# project to pixel space coordinates:
+	# ---------------
+	uSrcPx = (xSrc / zSrcSafe * focalX + cx).round().long()
+	uSrcPy = (ySrc / zSrcSafe * focalY + cy).round().long()
+	inBounds = (
+		(uSrcPx >= 0) & (uSrcPx < width) &
+		(uSrcPy >= 0) & (uSrcPy < height)
+	)
+
+	# disocclusion test:
+	# ---------------
+	disoccluded = torch.ones(width * height, dtype=torch.bool, device='cuda')
+
+	validIdx = inBounds.nonzero(as_tuple=False).squeeze(1)
+	uValid = uSrcPx[validIdx]
+	vValid = uSrcPy[validIdx]
+	zValid = zSrc[validIdx]
+
+	depthSrcSampled = depthSource[vValid, uValid]
+	visibleDepth = zValid <= depthSrcSampled * (1.0 + DEPTH_DISOCCLUSION_THRESHOLD)
+	disoccluded[validIdx[visibleDepth]] = False
+
+	# combine and create mask:
+	# ---------------
+	masked = disoccluded.reshape(height, width)
+
+	combined = colorNovel.clone()
+	uSrc2d = uSrcPx.reshape(height, width)
+	vSrc2d = uSrcPy.reshape(height, width)
+
+	visible = ~masked
+	uVis = uSrc2d[visible].clamp(0, width  - 1)
+	vVis = vSrc2d[visible].clamp(0, height - 1)
+	combined[visible] = colorNovel[vVis, uVis]
+
+	return combined, masked.to(torch.uint8) * 255
 
 # ------------------------------------------- #
 
@@ -72,67 +147,118 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 
 	torch.set_default_device('cuda')
 
-	# load src:
+	# load source:
 	# ---------------
 	print('Loading source image and PLY...')
 
-	orgImage = Image.open(orgImagePath)
+	orgImage = Image.open(orgImagePath).convert('RGB')
 	orgWidth, orgHeight = orgImage.width, orgImage.height
 	aspect = orgWidth / orgHeight
 
 	gaussians, focalY = load_ply(plyPath)
+	focalX = focalY # square pixels
 
 	fov  = 2 * math.atan(orgHeight / (2 * focalY))
 	proj = perspective(fov, aspect, 0.1, 1000.0)
 
 	up = torch.tensor([0.0, 1.0, 0.0])
 
-	settings_base = dict(
+	eyeSource    = torch.tensor([0.0, 0.0, 0.0])
+	targetSource = torch.tensor([0.0, 0.0, 1.0])
+	viewSource   = look_at(eyeSource, targetSource, up)
+	settingsBase = dict(
 		width=orgWidth,
 		height=orgHeight,
 		proj=proj,
-		focalX=focalY,
+		focalX=focalX,
 		focalY=focalY,
-		outputs=ddgs.RenderOutputs.COLOR,
 		debug=False,
 	)
 
-	# render:
+	# render source depth:
+	# ---------------
+	print('Rendering source depth...')
+
+	settingsSource = ddgs.Settings(
+		view    = viewSource,
+		outputs = ddgs.RenderOutputs.DEPTH,
+		**settingsBase,
+	)
+
+	with torch.no_grad():
+		renderSource = ddgs.render(settingsSource, *gaussians)
+
+	colorSource = torch.tensor(np.array(orgImage), dtype=torch.uint8, device='cuda')
+	depthSource = renderSource.depth.squeeze(-1)
+
+	# render stereo:
 	# ---------------
 	toSave = []
-	for ipd, stereoPath, maskPath in outStereoImages:
-		print(f'Rendering IPD={ipd*1000:.0f}mm...')
+	for entry in outStereoImages:
+		ipd, stereoPath, maskPath = entry
+		print(f'Rendering IPD = {ipd*1000:.0f}mm...')
 
-		eyeLeft    = torch.tensor([-ipd / 2, 0.0, 0.0])
-		targetLeft = torch.tensor([-ipd / 2, 0.0, 1.0])
-		viewLeft   = look_at(eyeLeft, targetLeft, up)
+		sides = [
+			('left',  torch.tensor([-ipd / 2, 0.0, 0.0]), torch.tensor([-ipd / 2, 0.0, 1.0])),
+			('right', torch.tensor([ ipd / 2, 0.0, 0.0]), torch.tensor([ ipd / 2, 0.0, 1.0])),
+		]
 
-		eyeRight    = torch.tensor([ipd / 2, 0.0, 0.0])
-		targetRight = torch.tensor([ipd / 2, 0.0, 1.0])
-		viewRight   = look_at(eyeRight, targetRight, up)
+		# render each side
+		eyeSide  = []
+		eyeView  = []
+		eyeColor = []
+		eyeDepth = []
+		for side, eye, target in sides:
+			view = look_at(eye, target, up)
+			eyeSide.append(side)
+			eyeView.append(view)
 
-		settingsLeft = ddgs.Settings(view=viewLeft, **settings_base)
-		with torch.no_grad():
-			renderLeft = ddgs.render(settingsLeft, *gaussians)
-		imgLeft = (renderLeft.color * 255).to(torch.uint8)
-		imgLeft  = torch.flip(imgLeft,  dims=[1])
+			settings = ddgs.Settings(
+				view    = view,
+				outputs = ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.DEPTH,
+				**settingsBase,
+			)
+			with torch.no_grad():
+				render = ddgs.render(settings, *gaussians)
 
-		settingsRight = ddgs.Settings(view=viewRight, **settings_base)
-		with torch.no_grad():
-			renderRight = ddgs.render(settingsRight, *gaussians)
-		imgRight = (renderRight.color * 255).to(torch.uint8)
-		imgRight = torch.flip(imgRight, dims=[1])
+			color = (render.color * 255).to(torch.uint8)
+			depth = render.depth.squeeze(-1)
 
-		left  = Image.fromarray(imgLeft .cpu().numpy(), 'RGB')
-		right = Image.fromarray(imgRight.cpu().numpy(), 'RGB')
+			eyeColor.append(color)
+			eyeDepth.append(depth)
 
-		stereo = Image.new('RGB', (orgWidth * 2, orgHeight))
-		stereo.paste(left,  (0, 0))
-		stereo.paste(right, (orgWidth, 0))
+		# combine with GT input
+		eyeCombined = []
+		eyeMask     = []
+		for i in range(2):
+			if maskPath is not None:
+				combined, mask = combine_outputs(
+					orgWidth, orgHeight, focalX, focalY,
+					viewSource, eyeView[i], 
+					colorSource, eyeColor[i],
+					depthSource, eyeDepth[i],
+					eyeSide=eyeSide[i]
+				)
+			else:
+				combined, mask = None, None
 
-		toSave.append((stereoPath, stereo))
+			eyeCombined.append(combined)
+			eyeMask.append(mask)
 
-	# wait for the previous frame's saves to finish before dispatching new ones:
+		# stitch into SBS and save
+		combined = Image.new('RGB', (orgWidth * 2, orgHeight))
+		combined.paste(Image.fromarray(eyeColor[0].cpu().numpy(), 'RGB'), (0,        0))
+		combined.paste(Image.fromarray(eyeColor[1].cpu().numpy(), 'RGB'), (orgWidth, 0))
+
+		maskImg  = None
+		if maskPath is not None:
+			maskImg = Image.new('L', (orgWidth * 2, orgHeight))
+			maskImg.paste(Image.fromarray(eyeMask[0].cpu().numpy(), 'L'), (0,        0))
+			maskImg.paste(Image.fromarray(eyeMask[1].cpu().numpy(), 'L'), (orgWidth, 0))
+
+		toSave.append((stereoPath, combined, maskPath, maskImg))
+
+	# wait for previous frame's saves:
 	# ---------------
 	if saveFutures is not None:
 		for f in saveFutures:
@@ -141,13 +267,20 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 	# dispatch saving:
 	# ---------------
 	print('Saving outputs...')
-	for _, path, _ in outStereoImages:
-		print(f'    - Stereo render: {path}')
+
+	futuresArgs = []
+	for stereoPath, stereo, maskPath, maskImg in toSave:
+		print(f'    - Stereo render: {stereoPath}')
+		futuresArgs.append((stereoPath, stereo))
+
+		if maskPath is not None and maskImg is not None:
+			print(f'    - Stereo mask:   {maskPath}')
+			futuresArgs.append((maskPath, maskImg))
 
 	ownExecutor = saveExecutor is None
-	executor    = saveExecutor or ThreadPoolExecutor(max_workers=len(toSave))
+	executor    = saveExecutor or ThreadPoolExecutor(max_workers=len(futuresArgs))
 	try:
-		newFutures = [executor.submit(save_stereo, path, img) for path, img in toSave]
+		newFutures = [executor.submit(save_image, path, img) for path, img in futuresArgs]
 		if ownExecutor:
 			for f in newFutures:
 				f.result()
@@ -165,21 +298,40 @@ if __name__ == "__main__":
 
 	parser = argparse.ArgumentParser(description="Render Gaussian splats directly at stereo eye positions")
 
+	# setup argparse:
+	# ---------------
 	parser.add_argument("img", help="Source image file, or a directory containing 'frames/' and 'plys/' subdirectories for sequence mode.")
 	parser.add_argument("ply", nargs="?", default=None, help="PLY file (single file mode only; inferred from img path if omitted).")
 
 	parser.add_argument("--start", type=int, default=None, help="First frame index to process, inclusive (sequence mode only).")
 	parser.add_argument("--end",   type=int, default=None, help="Last frame index to process, inclusive (sequence mode only).")
 
-	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo image path or directory.")
+	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo render directory.")
+	parser.add_argument("--out-mask",   type=str, default=None, help="Output mask directory. Default: <input>/masks/ or <base>_masks/.")
+	parser.add_argument("--no-mask",    action="store_true",    help="Disable mask/debug output entirely.")
+
 	parser.add_argument("--ipd", type=int, nargs="+", default=[56], metavar="MM",
-		help="One or more interpupillary distances in millimetres (default: 56).")
+		help="One or more IPDs in millimetres (default: 56).")
 	parser.add_argument("--resume", action="store_true",
 		help="Skip frames whose output files already exist on disk.")
 
 	args = parser.parse_args()
 
-	# sequence mode:
+	def make_out_paths(stereoBase, maskBase, ipdMM, stem, seq_mode):
+		stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
+		os.makedirs(stereoDir, exist_ok=True)
+		stereoOut = os.path.join(stereoDir, stem + ("" if seq_mode else "_stereo") + ".png")
+
+		if args.no_mask:
+			return (ipdMM / 1000.0, stereoOut, None, None)
+
+		maskDir = os.path.join(maskBase, f"ipd_{ipdMM:03d}")
+		os.makedirs(maskDir, exist_ok=True)
+		maskOut = os.path.join(maskDir, stem + ("" if seq_mode else "_mask") + ".png")
+
+		return (ipdMM / 1000.0, stereoOut, maskOut)
+
+	# sequence mode
 	# ---------------
 	if os.path.isdir(args.img):
 		inputDir  = args.img
@@ -208,9 +360,10 @@ if __name__ == "__main__":
 		if not frameFiles:
 			parser.error(f"No frames remain after applying --start/--end range.")
 
-		stereoBase = args.out_stereo if args.out_stereo else os.path.join(inputDir, "stereo")
+		stereoBase = args.out_stereo or os.path.join(inputDir, "stereo")
+		maskBase   = args.out_mask   or os.path.join(inputDir, "masks")
 
-		with ThreadPoolExecutor(max_workers=len(args.ipd)) as saveExecutor:
+		with ThreadPoolExecutor(max_workers=len(args.ipd) * 3) as saveExecutor:
 			failedFiles    = []
 			pendingFutures = None
 
@@ -224,14 +377,12 @@ if __name__ == "__main__":
 					failedFiles.append(frameFile)
 					continue
 
-				outStereoImages = []
-				for ipdMM in args.ipd:
-					stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
-					os.makedirs(stereoDir, exist_ok=True)
-					stereoOut = os.path.join(stereoDir, stem + ".png")
-					outStereoImages.append((ipdMM / 1000.0, stereoOut, None))
+				outStereoImages = [
+					make_out_paths(stereoBase, maskBase, ipdMM, stem, seq_mode=True)
+					for ipdMM in args.ipd
+				]
 
-				if args.resume and all(os.path.isfile(p) for (_, p, _) in outStereoImages):
+				if args.resume and all(os.path.isfile(p) for (_, p, _, _) in outStereoImages):
 					print(f'Skipping {frameFile} (outputs exist).')
 					continue
 
@@ -243,7 +394,7 @@ if __name__ == "__main__":
 						plyPath         = plyPath,
 						outStereoImages = outStereoImages,
 						saveFutures     = pendingFutures,
-						saveExecutor    = saveExecutor,
+						saveExecutor    = saveExecutor
 					)
 				except Exception as e:
 					print(f'Failed with exception: {e}')
@@ -268,17 +419,17 @@ if __name__ == "__main__":
 			parser.error(f"PLY file not found: '{plyPath}'.")
 
 		base       = os.path.splitext(args.img)[0]
-		stereoBase = args.out_stereo if args.out_stereo else base + "_stereo"
+		stereoBase = args.out_stereo or base + "_stereo"
+		maskBase   = args.out_mask   or base + "_masks"
+		debugBase  = args.out_debug  or base + "_debug"
 
-		outStereoImages = []
-		for ipdMM in args.ipd:
-			stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
-			os.makedirs(stereoDir, exist_ok=True)
-			stereoOut = os.path.join(stereoDir, os.path.basename(base) + "_stereo.png")
-			outStereoImages.append((ipdMM / 1000.0, stereoOut, None))
+		outStereoImages = [
+			make_out_paths(stereoBase, maskBase, debugBase, ipdMM, os.path.basename(base), seq_mode=False)
+			for ipdMM in args.ipd
+		]
 
 		render_stereo(
 			orgImagePath    = args.img,
 			plyPath         = plyPath,
-			outStereoImages = outStereoImages,
+			outStereoImages = outStereoImages
 		)

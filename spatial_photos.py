@@ -725,8 +725,8 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages,
 
 	outfilledWidth  = math.floor((1 + OUTFILL_AMOUNT) * orgWidth)
 	outfilledHeight = math.floor((1 + OUTFILL_AMOUNT) * orgHeight)
-	outfilledWidth  = (outfilledWidth  // BLOCK_SIZE) * BLOCK_SIZE
-	outfilledHeight = (outfilledHeight // BLOCK_SIZE) * BLOCK_SIZE
+	outfilledWidth  = ((outfilledWidth  + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+	outfilledHeight = ((outfilledHeight + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 	aspect = outfilledWidth / outfilledHeight
 
 	# load src:
