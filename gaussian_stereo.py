@@ -3,6 +3,7 @@ import math
 import ddgs
 import numpy as np
 import torch
+import argparse
 
 from PIL import Image
 from plyfile import PlyData
@@ -132,7 +133,7 @@ def compute_mask(
 
 # ------------------------------------------- #
 
-def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, saveExecutor=None, stereoMode='center'):
+def render_stereo(orgImagePath, plyPath, outRenders, saveFutures=None, saveExecutor=None, stereoMode='center'):
 
 	torch.set_default_device('cuda')
 
@@ -183,8 +184,8 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 	# render stereo:
 	# ---------------
 	toSave = []
-	for entry in outStereoImages:
-		ipd, stereoPath, maskPath = entry
+	for entry in outRenders:
+		ipd, renderPath, maskPath = entry
 		print(f'Rendering IPD = {ipd*1000:.0f}mm...')
 
 		eyeDist = ipd / 2 if stereoMode == 'center' else ipd
@@ -192,7 +193,8 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 			('left',  torch.tensor([-eyeDist, 0.0, 0.0]), torch.tensor([-eyeDist, 0.0, 1.0])),
 			('right', torch.tensor([ eyeDist, 0.0, 0.0]), torch.tensor([ eyeDist, 0.0, 1.0])),
 		]
-		fixedIdx = {'left': 0, 'right': 1, 'center': None}[stereoMode]
+		fixedIdx = {'left': 1, 'right': 0, 'center': None}[stereoMode]
+		novelIdx = {'left': 0, 'right': 1, 'center': [0, 1]}[stereoMode]
 
 		# render each side
 		eyeSideList  = []
@@ -240,22 +242,24 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 				)
 				eyeMask.append(mask)
 
-		# stitch into SBS
-		stereo = Image.new('RGB', (orgWidth * 2, orgHeight))
-		stereo.paste(Image.fromarray(eyeColor[0].cpu().numpy(), 'RGB'), (0,        0))
-		stereo.paste(Image.fromarray(eyeColor[1].cpu().numpy(), 'RGB'), (orgWidth, 0))
+		# stitch into SBS if needed
+		if stereoMode == 'center':
+			render = Image.new('RGB', (orgWidth * 2, orgHeight))
+			render.paste(Image.fromarray(eyeColor[0].cpu().numpy(), 'RGB'), (0,        0))
+			render.paste(Image.fromarray(eyeColor[1].cpu().numpy(), 'RGB'), (orgWidth, 0))
+		else:
+			render = Image.fromarray(eyeColor[novelIdx].cpu().numpy(), 'RGB')
 
-		maskImg = None
+		mask = None
 		if maskPath is not None and any(m is not None for m in eyeMask):
-			maskImg = Image.new('L', (orgWidth * 2, orgHeight))
+			if stereoMode == 'center':
+				mask = Image.new('L', (orgWidth * 2, orgHeight))
+				mask.paste(Image.fromarray(eyeMask[0].cpu().numpy(), 'L'), (0,        0))
+				mask.paste(Image.fromarray(eyeMask[1].cpu().numpy(), 'L'), (orgWidth, 0))
+			else:
+				mask = Image.fromarray(eyeMask[novelIdx].cpu().numpy(), 'L')
 
-			leftMask  = eyeMask[0] if eyeMask[0] is not None else torch.zeros(orgHeight, orgWidth, dtype=torch.uint8, device='cuda')
-			rightMask = eyeMask[1] if eyeMask[1] is not None else torch.zeros(orgHeight, orgWidth, dtype=torch.uint8, device='cuda')
-			
-			maskImg.paste(Image.fromarray(leftMask.cpu().numpy(),  'L'), (0,        0))
-			maskImg.paste(Image.fromarray(rightMask.cpu().numpy(), 'L'), (orgWidth, 0))
-
-		toSave.append((stereoPath, stereo, maskPath, maskImg))
+		toSave.append((renderPath, render, maskPath, mask))
 
 	# wait for previous frame's saves:
 	# ---------------
@@ -268,13 +272,13 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 	print('Saving outputs...')
 
 	futuresArgs = []
-	for stereoPath, stereo, maskPath, maskImg in toSave:
-		print(f'    - Stereo render:    {stereoPath}')
-		futuresArgs.append((stereoPath, stereo))
+	for renderPath, render, maskPath, mask in toSave:
+		print(f'    - Render:    {renderPath}')
+		futuresArgs.append((renderPath, render))
 
-		if maskPath is not None and maskImg is not None:
-			print(f'    - Stereo mask:      {maskPath}')
-			futuresArgs.append((maskPath, maskImg))
+		if maskPath is not None and mask is not None:
+			print(f'    - Mask:      {maskPath}')
+			futuresArgs.append((maskPath, mask))
 
 	ownExecutor = saveExecutor is None
 	executor    = saveExecutor or ThreadPoolExecutor(max_workers=len(futuresArgs))
@@ -293,20 +297,19 @@ def render_stereo(orgImagePath, plyPath, outStereoImages, saveFutures=None, save
 # ------------------------------------------- #
 
 if __name__ == "__main__":
-	import argparse
-
-	parser = argparse.ArgumentParser(description="Render Gaussian splats directly at stereo eye positions")
 
 	# setup argparse:
 	# ---------------
+	parser = argparse.ArgumentParser(description="Render Gaussian splats directly at stereo eye positions")
+
 	parser.add_argument("img", help="Source image file, or a directory containing 'frames/' and 'plys/' subdirectories for sequence mode.")
 	parser.add_argument("ply", nargs="?", default=None, help="PLY file (single file mode only; inferred from img path if omitted).")
 
 	parser.add_argument("--start", type=int, default=None, help="First frame index to process, inclusive (sequence mode only).")
 	parser.add_argument("--end",   type=int, default=None, help="Last frame index to process, inclusive (sequence mode only).")
 
-	parser.add_argument("--out-stereo", type=str, default=None, help="Output stereo render directory.")
-	parser.add_argument("--out-mask",   type=str, default=None, help="Output mask directory. Default: <input>/masks/ or <base>_masks/.")
+	parser.add_argument("--out-renders", type=str, default=None, help="Output render directory. Default: <input>/renders/")
+	parser.add_argument("--out-masks",   type=str, default=None, help="Output mask directory. Default: <input>/masks/")
 
 	parser.add_argument("--ipd", type=int, nargs="+", default=[56], metavar="MM",
 		help="One or more IPDs in millimetres (default: 56).")
@@ -314,24 +317,24 @@ if __name__ == "__main__":
 		help="Skip frames whose output files already exist on disk.")
 	parser.add_argument("--stereo-mode", choices=['center', 'left', 'right'], default='center',
 		help="Stereo rendering mode: 'center' renders both eyes as novel views (default); "
-		     "'left' uses orgImage for the left eye and renders only the right eye as a novel view; "
-		     "'right' uses orgImage for the right eye and renders only the left eye as a novel view.")
+		     "'left' uses the original image for the right eye and renders only the left eye as a novel view; "
+		     "'right' uses the original image for the left eye and renders only the right eye as a novel view.")
 
 	args = parser.parse_args()
 
-	def make_out_paths(stereoBase, maskBase, ipdMM, stem, seq_mode):
-		stereoDir = os.path.join(stereoBase, f"ipd_{ipdMM:03d}")
-		os.makedirs(stereoDir, exist_ok=True)
-		stereoOut = os.path.join(stereoDir, stem + ("" if seq_mode else "_stereo") + ".png")
+	def make_out_paths(renderBase, maskBase, ipdMM, stem):
+		renderDir = os.path.join(renderBase, f"ipd_{ipdMM:03d}")
+		os.makedirs(renderDir, exist_ok=True)
+		renderOut = os.path.join(renderDir, stem + ".png")
 
-		if args.out_mask is None:
-			return (ipdMM / 1000.0, stereoOut, None, None)
+		if args.out_masks is None:
+			return (ipdMM / 1000.0, renderOut, None, None)
 
 		maskDir = os.path.join(maskBase, f"ipd_{ipdMM:03d}")
 		os.makedirs(maskDir, exist_ok=True)
-		maskOut = os.path.join(maskDir, stem + ("" if seq_mode else "_mask") + ".png")
+		maskOut = os.path.join(maskDir, stem + ".png")
 
-		return (ipdMM / 1000.0, stereoOut, maskOut)
+		return (ipdMM / 1000.0, renderOut, maskOut)
 
 	# sequence mode
 	# ---------------
@@ -362,8 +365,8 @@ if __name__ == "__main__":
 		if not frameFiles:
 			parser.error(f"No frames remain after applying --start/--end range.")
 
-		stereoBase = args.out_stereo or os.path.join(inputDir, "stereo")
-		maskBase   = args.out_mask   or os.path.join(inputDir, "masks")
+		renderBase = args.out_renders or os.path.join(inputDir, "renders")
+		maskBase   = args.out_masks   or os.path.join(inputDir, "masks")
 
 		with ThreadPoolExecutor(max_workers=len(args.ipd) * 3) as saveExecutor:
 			failedFiles    = []
@@ -379,12 +382,12 @@ if __name__ == "__main__":
 					failedFiles.append(frameFile)
 					continue
 
-				outStereoImages = [
-					make_out_paths(stereoBase, maskBase, ipdMM, stem, seq_mode=True)
+				outRenders = [
+					make_out_paths(renderBase, maskBase, ipdMM, stem)
 					for ipdMM in args.ipd
 				]
 
-				if args.resume and all(os.path.isfile(p) for (_, p, _, _) in outStereoImages):
+				if args.resume and all(os.path.isfile(p) for (_, p, _, _) in outRenders):
 					print(f'Skipping {frameFile} (outputs exist).')
 					continue
 
@@ -392,12 +395,12 @@ if __name__ == "__main__":
 
 				try:
 					pendingFutures = render_stereo(
-						orgImagePath    = orgImagePath,
-						plyPath         = plyPath,
-						outStereoImages = outStereoImages,
-						saveFutures     = pendingFutures,
-						saveExecutor    = saveExecutor,
-						stereoMode      = args.stereo_mode,
+						orgImagePath = orgImagePath,
+						plyPath      = plyPath,
+						outRenders   = outRenders,
+						saveFutures  = pendingFutures,
+						saveExecutor = saveExecutor,
+						stereoMode   = args.stereo_mode,
 					)
 				except Exception as e:
 					print(f'Failed with exception: {e}')
@@ -422,17 +425,17 @@ if __name__ == "__main__":
 			parser.error(f"PLY file not found: '{plyPath}'.")
 
 		base       = os.path.splitext(args.img)[0]
-		stereoBase = args.out_stereo or base + "_stereo"
-		maskBase   = args.out_mask   or base + "_masks"
+		renderBase = args.out_renders or os.path.join(os.path.dirname(args.img), "render")
+		maskBase   = args.out_masks   or os.path.join(os.path.dirname(args.img), "mask")
 
-		outStereoImages = [
-			make_out_paths(stereoBase, maskBase, ipdMM, os.path.basename(base), seq_mode=False)
+		outRenders = [
+			make_out_paths(renderBase, maskBase, ipdMM, os.path.basename(base))
 			for ipdMM in args.ipd
 		]
 
 		render_stereo(
-			orgImagePath    = args.img,
-			plyPath         = plyPath,
-			outStereoImages = outStereoImages,
-			stereoMode      = args.stereo_mode,
+			orgImagePath = args.img,
+			plyPath      = plyPath,
+			outRenders   = outRenders,
+			stereoMode   = args.stereo_mode,
 		)
