@@ -325,14 +325,14 @@ if __name__ == "__main__":
 	def make_out_paths(renderBase, maskBase, ipdMM, stem):
 		renderDir = os.path.join(renderBase, f"ipd_{ipdMM:03d}")
 		os.makedirs(renderDir, exist_ok=True)
-		renderOut = os.path.join(renderDir, stem + ".png")
+		renderOut = os.path.join(renderDir, stem + "bmp")
 
 		if args.out_masks is None:
 			return (ipdMM / 1000.0, renderOut, None, None)
 
 		maskDir = os.path.join(maskBase, f"ipd_{ipdMM:03d}")
 		os.makedirs(maskDir, exist_ok=True)
-		maskOut = os.path.join(maskDir, stem + ".png")
+		maskOut = os.path.join(maskDir, stem + ".bmp")
 
 		return (ipdMM / 1000.0, renderOut, maskOut)
 

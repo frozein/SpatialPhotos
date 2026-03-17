@@ -62,40 +62,57 @@ def inpaint_video(render: str, mask: str, outPath: str):
 	os.replace(inpaintOut, outPath)
 	return outPath
 
-def extract_eyes(renderPattern: str, maskPattern: str, tmpDir: str, startFrame: int = 1):
+def extract_eyes(renderPattern: str, maskPattern: str, tmpDir: str, stereoMode: str = "center", startFrame: int = 1):
+
+	if stereoMode == "center":
+		eyes = [("left", 0), ("right", 1)]
+	elif stereoMode == "left":
+		eyes = [("left", None)]
+	else:
+		eyes = [("right", None)]
+
+	scale = f"scale={EYE_WIDTH}:{EYE_HEIGHT}"
 
 	paths = {}
-	for eye, xOffset in [("left", 0), ("right", 1)]:
+	for eye, xOffset in eyes:
 		renderDir = os.path.join(tmpDir, f"color_{eye}")
 		maskDir   = os.path.join(tmpDir, f"mask_{eye}")
 		os.makedirs(renderDir, exist_ok=True)
-		os.makedirs(maskDir  , exist_ok=True)
+		os.makedirs(maskDir,   exist_ok=True)
 
-		renderOut = os.path.join(renderDir, "%06d.png") 
-		maskOut   = os.path.join(maskDir, "%06d.png")
+		renderOut = os.path.join(renderDir, "%06d.bmp")
+		maskOut   = os.path.join(maskDir,   "%06d.bmp")
 
-		crop = f"crop=iw/2:ih:{xOffset}*iw/2:0"
+		if xOffset is not None:
+			crop = f"crop=iw/2:ih:{xOffset}*iw/2:0"
+			renderVf = f"{crop},{scale}:flags=lanczos"
+			maskVf   = f"{crop},{scale}:flags=neighbor"
+		else:
+			renderVf = f"{scale}:flags=lanczos"
+			maskVf   = f"{scale}:flags=neighbor"
 
 		run_ffmpeg([
 			"-start_number", str(startFrame),
 			"-i", renderPattern,
-			"-vf", crop,
+			"-vf", renderVf,
 			renderOut,
 		], label=f"extract color {eye}")
 
 		run_ffmpeg([
 			"-start_number", str(startFrame),
 			"-i", maskPattern,
-			"-vf", crop,
-			maskOut ,
+			"-vf", maskVf,
+			maskOut,
 		], label=f"extract binary mask {eye}")
 
 		paths[eye] = (renderOut, maskOut)
 
-	return (
-		paths["left"][0],  paths["right"][0],
-		paths["left"][1],  paths["right"][1],
-	)
+	leftRender  = paths["left"][0]  if "left"  in paths else None
+	rightRender = paths["right"][0] if "right" in paths else None
+	leftMask    = paths["left"][1]  if "left"  in paths else None
+	rightMask   = paths["right"][1] if "right" in paths else None
+
+	return leftRender, rightRender, leftMask, rightMask
 
 # ------------------------------------------- #
 
@@ -198,27 +215,15 @@ def main():
 
 		# extract per-eye sequences:
 		# ---------------
-		if args.stereo_mode == 'center':
-			print("Extracing eyes...")
+		print("Extracting eyes...")
 
-			leftRender, rightRender, leftMask, rightMask = extract_eyes(
-				renderPattern = args.render,
-				maskPattern   = args.mask,
-				tmpDir        = tmpDir,
-				startFrame    = args.start_frame,
-			)
-		elif args.stereo_mode == 'left':
-			leftRender = args.render
-			leftMask = args.mask
-
-			rightRender = None
-			rightMask = None
-		else:
-			leftRender = None
-			leftMask = None
-
-			rightRender = args.render
-			rightMask = args.mask
+		leftRender, rightRender, leftMask, rightMask = extract_eyes(
+			renderPattern = args.render,
+			maskPattern   = args.mask,
+			tmpDir        = tmpDir,
+			stereoMode    = args.stereo_mode,
+			startFrame    = args.start_frame,
+		)
 
 		# run inpainting:
 		# ---------------
