@@ -77,8 +77,7 @@ def compute_mask(
 	width, height, focalX, focalY,
 	viewSource, viewNovel,
 	colorSource, colorNovel,
-	depthSource, depthNovel,
-	eyeSide='right'
+	depthSource, depthNovel
 ):
 	cx = width  / 2.0
 	cy = height / 2.0
@@ -237,8 +236,7 @@ def render_stereo(orgImagePath, plyPath, outRenders, saveFutures=None, saveExecu
 					orgWidth, orgHeight, focalX, focalY,
 					viewSource, eyeView[i],
 					colorSource, eyeColor[i],
-					depthSource, eyeDepth[i],
-					eyeSide=eyeSideList[i]
+					depthSource, eyeDepth[i]
 				)
 				eyeMask.append(mask)
 
@@ -400,7 +398,7 @@ if __name__ == "__main__":
 						outRenders   = outRenders,
 						saveFutures  = pendingFutures,
 						saveExecutor = saveExecutor,
-						stereoMode   = args.stereo_mode,
+						stereoMode   = args.stereo_mode
 					)
 				except Exception as e:
 					print(f'Failed with exception: {e}')
