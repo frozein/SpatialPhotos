@@ -4,6 +4,10 @@
 *.png
 *.ply
 *.glb
+*.bmp
+
+# model weights
+*.pth
 
 # pycache
 **/__pycache__/
