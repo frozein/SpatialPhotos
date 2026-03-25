@@ -196,7 +196,7 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 	# collect present blocks:
 	# ---------------
 	meta = []
-	for idx, (img, _, _) in enumerate(slices):
+	for idx, (img, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // B, W // B
 
@@ -235,7 +235,7 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 		ax = (i % cols) * B
 		ay = (i // cols) * B
 
-		img, _, _ = slices[sliceIdx]
+		img, _ = slices[sliceIdx]
 		atlas[ay:ay+B, ax:ax+B] = img[srcPy:srcPy+B, srcPx:srcPx+B]
 
 		if maskAtlas is not None:
@@ -276,7 +276,7 @@ def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, _, _) in enumerate(slices):
+	for idx, (img, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // BLOCK_SIZE, W // BLOCK_SIZE
 
@@ -319,7 +319,7 @@ def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 		_, ax, ay, aw, ah, i = rect
 
 		sliceIdx, srcPx, srcPy, pw, ph, blockCoords = mergedMeta[i]
-		img, _, _ = slices[sliceIdx]
+		img, _ = slices[sliceIdx]
 
 		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
 		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
@@ -388,82 +388,25 @@ def fill_block_depths(placements, slices):
 	# build list of blocks to process:
 	# ---------------
 	blocks = torch.zeros((N, B, B), dtype=torch.float32, device='cuda')
-	sliceTs = torch.zeros(N, dtype=torch.float32, device='cuda')
 
 	for i, (sliceIdx, px, py) in enumerate(keys):
-		_, depth, slicePos = slices[sliceIdx]
-
+		_, depth = slices[sliceIdx]
 		blocks[i] = depth[py:py+B, px:px+B, 0]
-		sliceTs[i] = slicePos
 
-	# get per-block mean and stdev:
+	# compute mean depth:
 	# ---------------
 	valid = blocks > 0
 	validCount = valid.sum(dim=(1, 2)).float()
 
-	flat     = blocks.reshape(N, B * B)
-	validFlat = valid.reshape(N, B * B)
-
-	sumZ  = (flat * validFlat.float()).sum(dim=1)
+	sumZ  = (blocks * valid.float()).sum(dim=(1, 2))
 	meanZ = sumZ / validCount.clamp(min=1)
-
-	diffSq = ((flat - meanZ.unsqueeze(1)) ** 2) * validFlat.float()
-	varZ   = diffSq.sum(dim=1) / (validCount - 1).clamp(min=1)
-	stdevZ = varZ.sqrt()
-	stdevZ[validCount < 2] = 0.0
-
-	inlier = validFlat & (
-		(flat - meanZ.unsqueeze(1)).abs() <= DEPTH_INFILL_OUTLIER_STD * stdevZ.unsqueeze(1)
-	)
-	inlierCount = inlier.sum(dim=1).float()
-
-	# fit to plane:
-	# ---------------
-	gy = torch.arange(B, device='cuda', dtype=torch.float32)
-	gx = torch.arange(B, device='cuda', dtype=torch.float32)
-
-	yy, xx = torch.meshgrid(gy, gx, indexing='ij')
-	xxFlat = xx.reshape(B * B)
-	yyFlat = yy.reshape(B * B)
-	onesFlat = torch.ones(B * B, device='cuda')
-
-	A = torch.stack([xxFlat, yyFlat, onesFlat], dim=1)  # (P, 3)
-
-	inlierF = inlier.float().unsqueeze(2)
-	ABatch  = A.unsqueeze(0).expand(N, -1, -1) * inlierF
-	bBatch  = (flat * inlier.float()).unsqueeze(2)
-
-	sol = torch.linalg.lstsq(ABatch, bBatch).solution
-	a   = sol[:, 0, 0]
-	b   = sol[:, 1, 0]
-	c   = sol[:, 2, 0]
-
-	zEstFlat = (
-		a.unsqueeze(1) * xxFlat.unsqueeze(0) +
-		b.unsqueeze(1) * yyFlat.unsqueeze(0) +
-		c.unsqueeze(1)
-	)
 
 	# infill:
 	# ---------------
-	filled = flat.clone()
-	invalidFlat = ~validFlat
-
-	sparse   = (validCount / (B * B)) < DEPTH_INFILL_CUTOFF
-	useMean  = sparse.unsqueeze(1) & invalidFlat
-	usePlane = (~sparse).unsqueeze(1) & invalidFlat
-
-	filled[useMean]  = meanZ.unsqueeze(1).expand(N, B*B)[useMean]
-	filled[usePlane] = zEstFlat[usePlane]
-
-	noData = (validCount == 0)
-	filled[noData] = sliceTs[noData].unsqueeze(1).expand(-1, B*B)
-
-	noInlier = (inlierCount == 0) & ~noData
-	noInlier = noInlier.unsqueeze(1).expand(N, B*B)
-	filled[noInlier & invalidFlat] = meanZ.unsqueeze(1).expand(N, B*B)[noInlier & invalidFlat]
-
-	filled = filled.reshape(N, B, B)
+	filled = blocks.clone()
+	
+	invalid = ~valid
+	filled[invalid] =  meanZ.unsqueeze(-1).unsqueeze(-1).expand([-1, B, B])[invalid]
 
 	return {keys[i]: filled[i] for i in range(N)}
 
@@ -772,10 +715,7 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages,
 		render.depth[render.depth > zMax] = zMax
 		render.depth[(render.depth < zMin) & (render.depth > 0)] = zMin
 
-		sliceT   = (slice_t(i) + slice_t(i + 1)) * 0.5
-		slicePos = sliceT * (zMax - zMin) + zMin
-
-		slices.append([img, render.depth, slicePos])
+		slices.append([img, render.depth])
 
 	# replace with GT:
 	# ---------------
@@ -923,7 +863,7 @@ if __name__ == "__main__":
 		if not os.path.isdir(plysDir):
 			parser.error(f"Expected a 'plys/' subdirectory inside '{inputDir}'.")
 
-		IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}
+		IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.tiff'}
 		frameFiles = sorted(
 			f for f in os.listdir(framesDir)
 			if os.path.splitext(f)[1].lower() in IMAGE_EXTS
