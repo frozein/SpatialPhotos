@@ -196,7 +196,7 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 	# collect present blocks:
 	# ---------------
 	meta = []
-	for idx, (img, _) in enumerate(slices):
+	for idx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // B, W // B
 
@@ -235,7 +235,7 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 		ax = (i % cols) * B
 		ay = (i // cols) * B
 
-		img, _ = slices[sliceIdx]
+		img, _, _ = slices[sliceIdx]
 		atlas[ay:ay+B, ax:ax+B] = img[srcPy:srcPy+B, srcPx:srcPx+B]
 
 		if maskAtlas is not None:
@@ -276,7 +276,7 @@ def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, _) in enumerate(slices):
+	for idx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // BLOCK_SIZE, W // BLOCK_SIZE
 
@@ -319,7 +319,7 @@ def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 		_, ax, ay, aw, ah, i = rect
 
 		sliceIdx, srcPx, srcPy, pw, ph, blockCoords = mergedMeta[i]
-		img, _ = slices[sliceIdx]
+		img, _, _ = slices[sliceIdx]
 
 		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
 		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
@@ -388,14 +388,18 @@ def fill_block_depths(placements, slices):
 	# build list of blocks to process:
 	# ---------------
 	blocks = torch.zeros((N, B, B), dtype=torch.float32, device='cuda')
+	slicePositions = torch.zeros(N, dtype=torch.float32, device='cuda')
 
 	for i, (sliceIdx, px, py) in enumerate(keys):
-		_, depth = slices[sliceIdx]
+		_, depth, slicePos = slices[sliceIdx]
+
 		blocks[i] = depth[py:py+B, px:px+B, 0]
+		slicePositions[i] = slicePos
 
 	# compute mean depth:
 	# ---------------
 	valid = blocks > 0
+	invalid = ~valid
 	validCount = valid.sum(dim=(1, 2)).float()
 
 	sumZ  = (blocks * valid.float()).sum(dim=(1, 2))
@@ -403,10 +407,14 @@ def fill_block_depths(placements, slices):
 
 	# infill:
 	# ---------------
+	fillValue = torch.where(
+		validCount == 0,
+		slicePositions,
+		meanZ
+	).unsqueeze(-1).unsqueeze(-1).expand([-1, B, B])
+
 	filled = blocks.clone()
-	
-	invalid = ~valid
-	filled[invalid] =  meanZ.unsqueeze(-1).unsqueeze(-1).expand([-1, B, B])[invalid]
+	filled[invalid] = fillValue[invalid]
 
 	return {keys[i]: filled[i] for i in range(N)}
 
@@ -715,7 +723,10 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages,
 		render.depth[render.depth > zMax] = zMax
 		render.depth[(render.depth < zMin) & (render.depth > 0)] = zMin
 
-		slices.append([img, render.depth])
+		sliceT = (slice_t(i) + slice_t(i + 1)) * 0.5
+		slicePos = sliceT * (zMax - zMin) + zMin
+
+		slices.append([img, render.depth, slicePos])
 
 	# replace with GT:
 	# ---------------
