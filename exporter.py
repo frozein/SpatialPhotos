@@ -1,7 +1,10 @@
-from PIL import Image
-import pygltflib as gltf
 import io
+from os import PathLike
+from typing import Any, TypeAlias
+
 import numpy as np
+import pygltflib as gltf
+from PIL import Image
 
 # ------------------------------------------- #
 
@@ -29,37 +32,38 @@ MIME_TYPES = {
 WEBP_EXTENSION = "EXT_texture_webp"
 UV_PADDING = 1
 
+VertexFields: TypeAlias = tuple[Any, Any, Any, Any, Any, Any]
+NumpyVertexFields: TypeAlias = tuple[
+	np.ndarray,
+	np.ndarray,
+	np.ndarray,
+	np.ndarray,
+	np.ndarray,
+	np.ndarray,
+]
+RenderBuffers: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
+
 # ------------------------------------------- #
 
-def _to_numpy(array, dtype=None):
+def _to_numpy(array: Any, dtype: Any | None = None) -> np.ndarray:
 	if hasattr(array, "detach"):
 		array = array.detach().cpu().numpy()
 	return np.ascontiguousarray(array, dtype=dtype)
 
-def _get_vertex_fields(vertices):
-	if not isinstance(vertices, tuple) or len(vertices) != 6:
-		raise ValueError("vertices must be a tuple of six tensors")
-
+def _get_vertex_fields(vertices: VertexFields) -> NumpyVertexFields:
 	dtypes = (np.uint16, np.float32, np.uint16, np.uint16, np.uint16, np.uint16)
 	fields = tuple(_to_numpy(field, dtype) for field, dtype in zip(vertices, dtypes))
-	if any(field.ndim != 1 for field in fields):
-		raise ValueError("vertex fields must be one-dimensional")
-	if any(len(field) != len(fields[0]) for field in fields[1:]):
-		raise ValueError("vertex fields must have equal lengths")
-	if len(fields[0]) % 4 != 0:
-		raise ValueError("vertex fields must contain four consecutive values per quad")
-
 	return fields
 
 def _get_padded_atlas_coordinates(
-	sliceIdx,
-	sourceX,
-	sourceY,
-	atlasX,
-	atlasY,
+	sliceIdx: np.ndarray,
+	sourceX: np.ndarray,
+	sourceY: np.ndarray,
+	atlasX: np.ndarray,
+	atlasY: np.ndarray,
 	blockSize: int,
 	uvPadding: int,
-):
+) -> np.ndarray:
 	atlasCoordinates = np.empty((len(atlasX), 2), dtype=np.float32)
 	atlasCoordinates[:, 0] = atlasX
 	atlasCoordinates[:, 1] = atlasY
@@ -100,17 +104,15 @@ def _get_padded_atlas_coordinates(
 	return atlasCoordinates.reshape(-1, 2)
 
 def build_render_buffers(
-	atlas,
-	vertices,
+	atlas: Any,
+	vertices: VertexFields,
 	imageWidth: int,
 	imageHeight: int,
 	focal: float,
 	blockSize: int,
 	uvPadding: int = UV_PADDING,
-):
+) -> RenderBuffers:
 	sliceIdx, depth, sourceX, sourceY, atlasX, atlasY = _get_vertex_fields(vertices)
-	if uvPadding < 0 or uvPadding * 2 >= blockSize:
-		raise ValueError("uvPadding must be nonnegative and less than half the block size")
 
 	positions = np.empty((len(depth), 3), dtype=np.float32)
 	positions[:, 0] = sourceX
@@ -149,15 +151,22 @@ def build_render_buffers(
 	return positions, uvs, indices
 
 def export_glb(
-	atlas,
-	vertices,
+	atlas: Any,
+	vertices: VertexFields,
 	imageWidth: int,
 	imageHeight: int,
 	focal: float,
 	blockSize: int,
-	outPath,
+	outPath: str | PathLike[str],
 	uvPadding: int = UV_PADDING,
-):
+) -> None:
+	if min(imageWidth, imageHeight, blockSize) <= 0:
+		raise ValueError("image dimensions and blockSize must be positive")
+	if not np.isfinite(focal) or focal <= 0:
+		raise ValueError("focal must be positive and finite")
+	if uvPadding < 0 or uvPadding * 2 >= blockSize:
+		raise ValueError("uvPadding must be nonnegative and less than half the block size")
+
 	atlas = _to_numpy(atlas, np.uint8)
 	positions, uvs, indices = build_render_buffers(
 		atlas,

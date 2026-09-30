@@ -14,15 +14,15 @@ from spatial_photos import spatial_photo
 
 # ------------------------------------------- #
 
-CHECKPOINT_PATH = "/Users/daniel/Downloads/sharp.pt"
+CHECKPOINT_PATH = Path("/Users/daniel/Downloads/sharp.pt")
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ------------------------------------------- #
 
-def log_error(msg: str):
+def log_error(msg: str) -> None:
 	print(msg)
 
-def log_info(msg: str):
+def log_info(msg: str) -> None:
 	print(msg)
 
 # ------------------------------------------- #
@@ -34,11 +34,21 @@ def predict(
 	blockSize: int = 64,
 	outfillAmount: float = 0.0,
 	opaqueOnly: bool = False
-):
+) -> None:
+
+	# validate:
+	# ---------------
+	if not inputPath.exists():
+		raise FileNotFoundError(f"Input path does not exist: {inputPath}")
+	if numSlices <= 0 or blockSize <= 0:
+		raise ValueError("numSlices and blockSize must be positive")
+	if not math.isfinite(outfillAmount) or outfillAmount < 0:
+		raise ValueError("outfillAmount must be nonnegative and finite")
+
 	# get list of input images:
 	# ---------------
 	inputIsFile = inputPath.is_file()
-	imagePaths = []
+	imagePaths: list[Path] = []
 	if inputIsFile:
 		if inputPath.suffix in io.get_supported_image_extensions():
 			imagePaths = [inputPath]
@@ -110,7 +120,8 @@ def predict(
 			outPath=outGLB,
 		)
 
-predict(
-	Path("/Users/daniel/Downloads/test_scaled.png"),
-	Path("/Users/daniel/Downloads")
-)
+if __name__ == "__main__":
+	predict(
+		Path("/Users/daniel/Downloads/test_scaled.png"),
+		Path("/Users/daniel/Downloads"),
+	)

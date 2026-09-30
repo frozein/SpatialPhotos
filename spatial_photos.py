@@ -1,7 +1,11 @@
 import math
+from collections.abc import Sequence
+from typing import TypeAlias
+
 import numpy as np
 import torch
 import rectpack
+from rectpack.packer import PackerBBF
 
 from sharp.utils.gaussians import Gaussians3D
 
@@ -23,6 +27,26 @@ ALPHA_SOLID_THRESHOLD = 128
 ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
 
+Rectangle: TypeAlias = tuple[int, int, int, int]
+PatchDimensions: TypeAlias = tuple[int, int]
+SpatialSlice: TypeAlias = tuple[torch.Tensor, torch.Tensor, float]
+BlockPlacement: TypeAlias = tuple[int, int, int, int, int]
+VertexFields: TypeAlias = tuple[
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+]
+GaussianSlice: TypeAlias = tuple[
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+	torch.Tensor,
+]
+
 # ------------------------------------------- #
 
 def look_at(
@@ -31,13 +55,16 @@ def look_at(
 	up: torch.Tensor
 ) -> torch.Tensor:
 	f = (target - eye)
-	f = f / torch.norm(f)
-	u = up / torch.norm(up)
+	forwardNorm = torch.norm(f)
+	upNorm = torch.norm(up)
+	f = f / forwardNorm
+	u = up / upNorm
 	s = torch.cross(f, u, dim=0)
-	s = s / torch.norm(s)
+	sideNorm = torch.norm(s)
+	s = s / sideNorm
 	u = torch.cross(s, f, dim=0)
 
-	m = torch.eye(4, dtype=torch.float32)
+	m = torch.eye(4, dtype=torch.float32, device=eye.device)
 	m[0, :3] = s
 	m[1, :3] = u
 	m[2, :3] = -f
@@ -74,14 +101,14 @@ def linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
 
 # ------------------------------------------- #
 
-def slice_t(idx: int, numSlices: int) -> int:
+def slice_t(idx: int, numSlices: int) -> float:
 	return (idx / numSlices) * (idx / numSlices)
 
 def get_slice(
 	gaussians: Gaussians3D, 
 	zMin: float, zMax: float, 
 	idx: int, numSlices: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> GaussianSlice:
 	means = gaussians.mean_vectors.flatten(0, 1)
 	scales = gaussians.singular_values.flatten(0, 1)
 	rotations = gaussians.quaternions.flatten(0, 1)
@@ -109,10 +136,10 @@ def get_slice(
 		colors[where]
 	)
 
-def maximal_rectangles(mask):
+def maximal_rectangles(mask: np.ndarray) -> list[Rectangle]:
 	h, w = mask.shape
 	heights = np.zeros(w, dtype=int)
-	rects = []
+	rects: list[Rectangle] = []
 
 	for y in range(h):
 		for x in range(w):
@@ -134,9 +161,9 @@ def maximal_rectangles(mask):
 
 	return rects
 
-def greedy_mesh(mask):
+def greedy_mesh(mask: np.ndarray) -> list[Rectangle]:
 	mask = mask.copy()
-	rectsOut = []
+	rectsOut: list[Rectangle] = []
 
 	while np.any(mask):
 		rects = maximal_rectangles(mask)
@@ -148,8 +175,7 @@ def greedy_mesh(mask):
 
 	return rectsOut
 
-def pack_blocks(patchDims):
-
+def pack_blocks(patchDims: Sequence[PatchDimensions]) -> PackerBBF:
 	minRequiredSize = max(
 		max(max(width, height) for width, height in patchDims),
 		math.ceil(math.sqrt(sum(width * height for width, height in patchDims))),
@@ -160,7 +186,7 @@ def pack_blocks(patchDims):
 
 	# binary search to find best size:
 	# ---------------
-	def fits(size):
+	def fits(size: int) -> bool:
 		packer = rectpack.newPacker(rotation=False)
 		for i, (w, h) in enumerate(patchDims):
 			packer.add_rect(w, h, i)
@@ -197,12 +223,12 @@ def pack_blocks(patchDims):
 	return finalPacker
 
 def generate_block_atlas(
-	slices, 
+	slices: Sequence[SpatialSlice],
 	blockSize: int, 
 	opaqueOnly: bool
-):
-	sourceOrigins = []
-	patchDims = []
+) -> tuple[torch.Tensor, list[BlockPlacement]]:
+	sourceOrigins: list[tuple[int, int, int]] = []
+	patchDims: list[PatchDimensions] = []
 
 	# greedy mesh each slice:
 	# ---------------
@@ -222,6 +248,9 @@ def generate_block_atlas(
 			sourceOrigins.append((sliceIdx, gx * blockSize, gy * blockSize))
 			patchDims.append((gw * blockSize, gh * blockSize))
 
+	if not patchDims:
+		raise ValueError("No visible blocks were found in the rendered slices")
+
 	# pack greedy meshed rects:
 	# ---------------
 	packer = pack_blocks(patchDims)
@@ -231,7 +260,7 @@ def generate_block_atlas(
 
 	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
-	blocks = []
+	blocks: list[BlockPlacement] = []
 
 	for rect in packer.rect_list():
 		_, atlasX, atlasY, patchWidth, patchHeight, i = rect
@@ -269,10 +298,10 @@ def generate_block_atlas(
 	return atlas, blocks
 
 def fill_block_depths(
-	blocks,
-	slices, 
+	blocks: Sequence[BlockPlacement],
+	slices: Sequence[SpatialSlice],
 	blockSize: int
-):
+) -> torch.Tensor:
 	N = len(blocks)
 
 	# build list of blocks to process:
@@ -308,7 +337,14 @@ def fill_block_depths(
 
 	return filled
 
-def build_depth_grid(blocks, slices, imageWidth, imageHeight, numSlices: int, blockSize: int):
+def build_depth_grid(
+	blocks: Sequence[BlockPlacement],
+	slices: Sequence[SpatialSlice],
+	imageWidth: int,
+	imageHeight: int,
+	numSlices: int,
+	blockSize: int,
+) -> torch.Tensor:
 	N = len(blocks)
 	gridWidth = imageWidth // blockSize
 	gridHeight = imageHeight // blockSize
@@ -360,7 +396,11 @@ def build_depth_grid(blocks, slices, imageWidth, imageHeight, numSlices: int, bl
 
 	return zGrid
 
-def build_vertices(zGrid, blocks, blockSize: int):
+def build_vertices(
+	zGrid: torch.Tensor,
+	blocks: Sequence[BlockPlacement],
+	blockSize: int,
+) -> VertexFields:
 	blocks = sorted(blocks, key=lambda block: block[0], reverse=True)
 	N = len(blocks)
 
@@ -391,8 +431,14 @@ def build_vertices(zGrid, blocks, blockSize: int):
 		cornerAtlasY.reshape(N * 4).to(torch.uint16),
 	)
 
-def replace_gt_color(slices, image, outfilledWidth, outfilledHeight, orgWidth, orgHeight):
-
+def replace_gt_color(
+	slices: list[SpatialSlice],
+	image: np.ndarray,
+	outfilledWidth: int,
+	outfilledHeight: int,
+	orgWidth: int,
+	orgHeight: int,
+) -> list[SpatialSlice]:
 	orgRGB = torch.tensor(
 		np.flip(image, axis=1).copy(),
 		device=DEVICE
@@ -445,13 +491,24 @@ def spatial_photo(
 	numSlices: int = 30,
 	blockSize: int = 64,
 	opaqueOnly: bool = False
-):
+) -> tuple[torch.Tensor, VertexFields]:
+	
+	# validate:
+	# ---------------
+	if image.ndim != 3 or image.shape[2] != 3:
+		raise ValueError("image must have shape (H, W, 3)")
+	if not math.isfinite(focalY) or focalY <= 0:
+		raise ValueError("focalY must be positive and finite")
+	if min(outputWidth, outputHeight, numSlices, blockSize) <= 0:
+		raise ValueError("output dimensions, numSlices, and blockSize must be positive")
 
 	torch.set_default_device(DEVICE)
 
 	# compute dimensions + settings:
 	# ---------------
 	orgHeight, orgWidth = image.shape[:2]
+	if outputWidth < orgWidth or outputHeight < orgHeight:
+		raise ValueError("output dimensions must contain the input image")
 
 	if outputWidth % blockSize != 0 or outputHeight % blockSize != 0:
 		raise ValueError("Output dimensions must be multiples of blockSize")
@@ -478,6 +535,9 @@ def spatial_photo(
 	)
 
 	means = gaussians.mean_vectors.flatten(0, 1)
+	if len(means) == 0:
+		raise ValueError("gaussians must not be empty")
+
 	zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
 	zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
 
@@ -485,7 +545,7 @@ def spatial_photo(
 	# ---------------
 	print('Rendering slices...')
 
-	slices = []
+	slices: list[SpatialSlice] = []
 	for i in range(numSlices):
 		with torch.no_grad():
 			render = ddgs.render(
@@ -506,7 +566,7 @@ def spatial_photo(
 		sliceT = (slice_t(i, numSlices) + slice_t(i + 1, numSlices)) * 0.5
 		slicePos = sliceT * (zMax - zMin) + zMin
 
-		slices.append([img, render.depth, slicePos])
+		slices.append((img, render.depth, slicePos))
 
 	# replace with GT:
 	# ---------------
