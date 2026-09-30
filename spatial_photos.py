@@ -10,8 +10,6 @@ if torch.cuda.is_available():
 else:
 	import ddgs_cpu as ddgs
 
-import exporter
-
 # ------------------------------------------- #
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -24,8 +22,6 @@ ALPHA_SOLID_THRESHOLD = 128
 
 ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
-
-UV_PADDING = 1
 
 # ------------------------------------------- #
 
@@ -152,24 +148,33 @@ def greedy_mesh(mask):
 
 	return rectsOut
 
-def pack_blocks(mergedBlockDims):
+def pack_blocks(patchDims):
+
+	minRequiredSize = max(
+		max(max(width, height) for width, height in patchDims),
+		math.ceil(math.sqrt(sum(width * height for width, height in patchDims))),
+	)
+
+	if minRequiredSize > ATLAS_MAX_SIZE:
+		raise ValueError("Block atlas exceeds ATLAS_MAX_SIZE")
 
 	# binary search to find best size:
 	# ---------------
 	def fits(size):
 		packer = rectpack.newPacker(rotation=False)
-		for i, (w, h) in enumerate(mergedBlockDims):
+		for i, (w, h) in enumerate(patchDims):
 			packer.add_rect(w, h, i)
 
 		packer.add_bin(size, size)
 		packer.pack()
 
-		return len(packer.rect_list()) == len(mergedBlockDims)
+		return len(packer.rect_list()) == len(patchDims)
 
-	low, high = ATLAS_MIN_SIZE, ATLAS_MAX_SIZE
-	bestSize = high
+	low = max(ATLAS_MIN_SIZE, minRequiredSize)
+	high = ATLAS_MAX_SIZE
+	bestSize = None
 
-	while (high - low) > ATLAS_MIN_SIZE:
+	while low <= high:
 		mid = (low + high) // 2
 		if fits(mid):
 			bestSize = mid
@@ -177,10 +182,13 @@ def pack_blocks(mergedBlockDims):
 		else:
 			low = mid + 1
 
+	if bestSize is None:
+		raise ValueError("Could not pack blocks within ATLAS_MAX_SIZE")
+
 	# pack using best size:
 	# ---------------
 	finalPacker = rectpack.newPacker(rotation=False)
-	for i, (w, h) in enumerate(mergedBlockDims):
+	for i, (w, h) in enumerate(patchDims):
 		finalPacker.add_rect(w, h, i)
 
 	finalPacker.add_bin(bestSize, bestSize)
@@ -193,73 +201,56 @@ def generate_block_atlas(
 	blockSize: int, 
 	opaqueOnly: bool
 ):
-	mergedMeta = []
-	mergedDims = []
+	sourceOrigins = []
+	patchDims = []
 
 	# greedy mesh each slice:
 	# ---------------
-	for idx, (img, _, _) in enumerate(slices):
+	for sliceIdx, (img, _, _) in enumerate(slices):
 		H, W, _ = img.shape
 		GH, GW = H // blockSize, W // blockSize
 
-		alpha = img[:GH*blockSize, :GW*blockSize, 3]
-		alpha = alpha.reshape(GH, blockSize, GW, blockSize)
-
 		threshold = ALPHA_SOLID_THRESHOLD if opaqueOnly else ALPHA_THRESHOLD
-		present = (alpha >= threshold).any(dim=1).any(dim=2)
-		presentCpu = present.cpu().numpy()
+		alpha = img[:GH*blockSize, :GW*blockSize, 3]
+		alphaBlocks = alpha.reshape(GH, blockSize, GW, blockSize)
+		presentCpu = (alphaBlocks >= threshold).any(dim=(1, 3)).cpu().numpy()
 
 		if not np.any(presentCpu):
 			continue
 
-		rects = greedy_mesh(presentCpu)
-
-		for (gx, gy, gw, gh) in rects:
-			px, py = gx * blockSize, gy * blockSize
-			pw, ph = gw * blockSize, gh * blockSize
-
-			blockCoords = [(gx + dx, gy + dy) for dy in range(gh) for dx in range(gw)]
-			mergedMeta.append((idx, px, py, pw, ph, blockCoords))
-			mergedDims.append((pw, ph))
+		for gx, gy, gw, gh in greedy_mesh(presentCpu):
+			sourceOrigins.append((sliceIdx, gx * blockSize, gy * blockSize))
+			patchDims.append((gw * blockSize, gh * blockSize))
 
 	# pack greedy meshed rects:
 	# ---------------
-	packer = pack_blocks(mergedDims)
+	packer = pack_blocks(patchDims)
 
 	bin0 = packer.bin_list()[0]
 	atlasW, atlasH = bin0
 
 	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
-	placements = []
+	blocks = []
 
 	for rect in packer.rect_list():
-		_, ax, ay, aw, ah, i = rect
+		_, atlasX, atlasY, patchWidth, patchHeight, i = rect
 
-		sliceIdx, srcPx, srcPy, pw, ph, blockCoords = mergedMeta[i]
+		sliceIdx, sourceX, sourceY = sourceOrigins[i]
 		img, _, _ = slices[sliceIdx]
 
-		srcPatch = img[srcPy:srcPy+ph, srcPx:srcPx+pw]
-		atlas[ay:ay+ah, ax:ax+aw] = srcPatch
+		atlas[atlasY:atlasY+patchHeight, atlasX:atlasX+patchWidth] = \
+			img[sourceY:sourceY+patchHeight, sourceX:sourceX+patchWidth]
 
-		for (gx, gy) in blockCoords:
-			bx = gx * blockSize
-			by = gy * blockSize
-
-			ox = bx - srcPx
-			oy = by - srcPy
-
-			padLeft  = UV_PADDING if (ox == 0)              else 0
-			padRight = UV_PADDING if (ox + blockSize >= pw) else 0
-			padTop   = UV_PADDING if (oy == 0)              else 0
-			padBot   = UV_PADDING if (oy + blockSize >= ph) else 0
-
-			u0 = (ax + ox + padLeft) / atlasW
-			v0 = (ay + oy + padTop) / atlasH
-			u1 = (ax + ox + blockSize - padRight) / atlasW
-			v1 = (ay + oy + blockSize - padBot) / atlasH
-
-			placements.append((sliceIdx, bx, by, u0, v1, u1, v0))
+		for blockY in range(0, patchHeight, blockSize):
+			for blockX in range(0, patchWidth, blockSize):
+				blocks.append((
+					sliceIdx,
+					sourceX + blockX,
+					sourceY + blockY,
+					atlasX + blockX,
+					atlasY + blockY,
+				))
 
 	if opaqueOnly:
 		opaque = atlas[..., 3] >= ALPHA_SOLID_THRESHOLD
@@ -275,44 +266,33 @@ def generate_block_atlas(
 
 		atlas[..., 3] = opaque.to(atlas.dtype) * 255
 
-	return atlas, placements
+	return atlas, blocks
 
 def fill_block_depths(
-	placements, 
+	blocks,
 	slices, 
 	blockSize: int
 ):
-
-	# collect unique blocks:
-	# ---------------
-	seen = {}
-	keys = []
-	for (sliceIdx, px, py, *_) in placements:
-		key = (sliceIdx, px, py)
-		if key not in seen:
-			seen[key] = len(keys)
-			keys.append(key)
-
-	N = len(keys)
+	N = len(blocks)
 
 	# build list of blocks to process:
 	# ---------------
-	blocks = torch.zeros((N, blockSize, blockSize), dtype=torch.float32, device=DEVICE)
+	blockDepths = torch.zeros((N, blockSize, blockSize), dtype=torch.float32, device=DEVICE)
 	slicePositions = torch.zeros(N, dtype=torch.float32, device=DEVICE)
 
-	for i, (sliceIdx, px, py) in enumerate(keys):
+	for i, (sliceIdx, sourceX, sourceY, *_) in enumerate(blocks):
 		_, depth, slicePos = slices[sliceIdx]
 
-		blocks[i] = depth[py:py+blockSize, px:px+blockSize, 0]
+		blockDepths[i] = depth[sourceY:sourceY+blockSize, sourceX:sourceX+blockSize, 0]
 		slicePositions[i] = slicePos
 
 	# compute mean depth:
 	# ---------------
-	valid = blocks > 0
+	valid = blockDepths > 0
 	invalid = ~valid
 	validCount = valid.sum(dim=(1, 2)).float()
 
-	sumZ  = (blocks * valid.float()).sum(dim=(1, 2))
+	sumZ  = (blockDepths * valid.float()).sum(dim=(1, 2))
 	meanZ = sumZ / validCount.clamp(min=1)
 
 	# infill:
@@ -323,58 +303,55 @@ def fill_block_depths(
 		meanZ
 	).unsqueeze(-1).unsqueeze(-1).expand([-1, blockSize, blockSize])
 
-	filled = blocks.clone()
+	filled = blockDepths.clone()
 	filled[invalid] = fillValue[invalid]
 
-	return {keys[i]: filled[i] for i in range(N)}
+	return filled
 
-def build_geometry(placements, slices, width, height, focal, aspect, numSlices: int, blockSize: int):
-
-	# sort blocks by slice idx:
-	# ---------------
-	placements = sorted(placements, key=lambda x: x[0])
-	N = len(placements)
+def build_depth_grid(blocks, slices, imageWidth, imageHeight, numSlices: int, blockSize: int):
+	N = len(blocks)
+	gridWidth = imageWidth // blockSize
+	gridHeight = imageHeight // blockSize
 
 	# infill depth for each block:
 	# ---------------
-	blockDepths = fill_block_depths(placements, slices, blockSize)
+	blockDepths = fill_block_depths(blocks, slices, blockSize)
 
 	# average depth at corners, enforce monotonicity:
 	# ---------------
-	GW = width  // blockSize
-	GH = height // blockSize
+	zGrid = torch.zeros(
+		(numSlices, gridHeight + 1, gridWidth + 1),
+		dtype=torch.float32,
+		device=DEVICE,
+	)
+	countGrid = torch.zeros_like(zGrid)
 
-	zGrid = torch.zeros((numSlices, GH + 1, GW + 1), dtype=torch.float32, device=DEVICE)
-	countGrid = torch.zeros((numSlices, GH + 1, GW + 1), dtype=torch.float32, device=DEVICE)
+	blockSliceIdx = torch.tensor([block[0] for block in blocks], dtype=torch.long, device=DEVICE)
+	blockX = torch.tensor([block[1] // blockSize for block in blocks], dtype=torch.long, device=DEVICE)
+	blockY = torch.tensor([block[2] // blockSize for block in blocks], dtype=torch.long, device=DEVICE)
 
-	plSliceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long, device=DEVICE)
-	plGx = torch.tensor([p[1] // blockSize for p in placements], dtype=torch.long, device=DEVICE)
-	plGy = torch.tensor([p[2] // blockSize for p in placements], dtype=torch.long, device=DEVICE)
-
-	cornerDGx = torch.tensor([0, 1, 0, 1], dtype=torch.long, device=DEVICE)
-	cornerDGy = torch.tensor([0, 0, 1, 1], dtype=torch.long, device=DEVICE)
+	cornerDX = torch.tensor([0, 1, 0, 1], dtype=torch.long, device=DEVICE)
+	cornerDY = torch.tensor([0, 0, 1, 1], dtype=torch.long, device=DEVICE)
 	cornerRow = torch.tensor([0, 0, blockSize-1, blockSize-1], dtype=torch.long, device=DEVICE)
 	cornerCol = torch.tensor([0, blockSize-1, 0, blockSize-1], dtype=torch.long, device=DEVICE)
 
-	cvx = (plGx.unsqueeze(1) + cornerDGx.unsqueeze(0)).clamp(max=GW)
-	cvy = (plGy.unsqueeze(1) + cornerDGy.unsqueeze(0)).clamp(max=GH)
-	s   = plSliceIdx.unsqueeze(1).expand(N, 4)
+	cornerX = blockX.unsqueeze(1) + cornerDX.unsqueeze(0)
+	cornerY = blockY.unsqueeze(1) + cornerDY.unsqueeze(0)
+	cornerSliceIdx = blockSliceIdx.unsqueeze(1).expand(N, 4)
 
-	keysList = [(p[0], p[1], p[2]) for p in placements]
-	blocksTensor = torch.stack([blockDepths[(si, px, py)] for (si, px, py) in keysList])
-	vals = blocksTensor[:, cornerRow, cornerCol]
+	values = blockDepths[:, cornerRow, cornerCol]
+	valid = values > 0.0
 
-	validBounds = (plGx.unsqueeze(1) + cornerDGx.unsqueeze(0) <= GW) & \
-	              (plGy.unsqueeze(1) + cornerDGy.unsqueeze(0) <= GH)
-	validDepth = vals > 0.0
-	valid = validBounds & validDepth
+	flatIdx = (
+		cornerSliceIdx * (gridHeight + 1) * (gridWidth + 1)
+		+ cornerY * (gridWidth + 1)
+		+ cornerX
+	).reshape(-1)
+	flatValues = (values * valid.float()).reshape(-1)
+	flatCount = valid.float().reshape(-1)
 
-	flatIdx = (s * (GH+1) * (GW+1) + cvy * (GW+1) + cvx).reshape(-1)  # (N*4,)
-	flatVals = (vals  * valid.float()).reshape(-1)
-	latCount = valid.float().reshape(-1)
-
-	zGrid    .reshape(-1).scatter_add_(0, flatIdx, flatVals)
-	countGrid.reshape(-1).scatter_add_(0, flatIdx, latCount)
+	zGrid.reshape(-1).scatter_add_(0, flatIdx, flatValues)
+	countGrid.reshape(-1).scatter_add_(0, flatIdx, flatCount)
 
 	hasData = countGrid > 0
 	zGrid[hasData] = zGrid[hasData] / countGrid[hasData]
@@ -383,70 +360,36 @@ def build_geometry(placements, slices, width, height, focal, aspect, numSlices: 
 
 	return zGrid
 
-def finish_geometry(zGrid, placements, width, height, focal, aspect, numSlices: int, blockSize: int):
-	placements = sorted(placements, key=lambda x: x[0], reverse=True)
-	N = len(placements)
+def build_vertices(zGrid, blocks, blockSize: int):
+	blocks = sorted(blocks, key=lambda block: block[0], reverse=True)
+	N = len(blocks)
 
-	GW = width  // blockSize
-	GH = height // blockSize
+	sliceIdx = torch.tensor([block[0] for block in blocks], dtype=torch.long, device=DEVICE)
+	sourceX = torch.tensor([block[1] for block in blocks], dtype=torch.long, device=DEVICE)
+	sourceY = torch.tensor([block[2] for block in blocks], dtype=torch.long, device=DEVICE)
+	atlasX = torch.tensor([block[3] for block in blocks], dtype=torch.long, device=DEVICE)
+	atlasY = torch.tensor([block[4] for block in blocks], dtype=torch.long, device=DEVICE)
 
-	# enforce monotonicity across slices:
-	# ---------------
-	zGrid, _ = zGrid.cummax(dim=0)
+	sourceGridX = sourceX // blockSize
+	sourceGridY = sourceY // blockSize
+	cornerGridX = torch.stack([sourceGridX, sourceGridX + 1, sourceGridX + 1, sourceGridX], dim=1)
+	cornerGridY = torch.stack([sourceGridY + 1, sourceGridY + 1, sourceGridY, sourceGridY], dim=1)
+	cornerSliceIdx = sliceIdx.unsqueeze(1).expand(N, 4)
+	cornerAtlasX = torch.stack([atlasX, atlasX + blockSize, atlasX + blockSize, atlasX], dim=1)
+	cornerAtlasY = torch.stack([atlasY + blockSize, atlasY + blockSize, atlasY, atlasY], dim=1)
 
-	# compute worldspace vertex coordinates:
-	# ---------------
-	gxCoords = torch.arange(GW + 1, device=DEVICE, dtype=torch.float32) * blockSize
-	gyCoords = torch.arange(GH + 1, device=DEVICE, dtype=torch.float32) * blockSize
+	depth = zGrid[cornerSliceIdx, cornerGridY, cornerGridX]
+	cornerSourceX = cornerGridX * blockSize
+	cornerSourceY = cornerGridY * blockSize
 
-	xOffset = gxCoords - width  * 0.5
-	yOffset = height * 0.5 - gyCoords
-
-	xOffset = xOffset.unsqueeze(0).unsqueeze(0).expand(numSlices, GH+1, GW+1)
-	yOffset = yOffset.unsqueeze(0).unsqueeze(2).expand(numSlices, GH+1, GW+1)
-
-	xWorld = xOffset * zGrid / focal
-	yWorld = yOffset * zGrid / focal
-
-	# compute positions and uvs:
-	# ---------------
-	plSiceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long,   device=DEVICE)
-	plPx      = torch.tensor([p[1] for p in placements], dtype=torch.long,   device=DEVICE)
-	plPy      = torch.tensor([p[2] for p in placements], dtype=torch.long,   device=DEVICE)
-	plU0      = torch.tensor([p[3] for p in placements], dtype=torch.float32, device=DEVICE)
-	plV0      = torch.tensor([p[4] for p in placements], dtype=torch.float32, device=DEVICE)
-	plU1      = torch.tensor([p[5] for p in placements], dtype=torch.float32, device=DEVICE)
-	plV1      = torch.tensor([p[6] for p in placements], dtype=torch.float32, device=DEVICE)
-
-	gx0 = plPx // blockSize
-	gy0 = plPy // blockSize
-	gx1 = gx0 + 1
-	gy1 = gy0 + 1
-
-	cornerGx = torch.stack([gx0, gx1, gx1, gx0], dim=1)
-	cornerGy = torch.stack([gy1, gy1, gy0, gy0], dim=1)
-	cornerSliceIdx = plSiceIdx.unsqueeze(1).expand(N, 4)
-
-	cx = xWorld[cornerSliceIdx, cornerGy, cornerGx]
-	cy = yWorld[cornerSliceIdx, cornerGy, cornerGx]
-	cz = zGrid[cornerSliceIdx, cornerGy, cornerGx]
-
-	positions = torch.stack([cx, cy, cz], dim=2).reshape(N * 4, 3)
-
-	uvCorners = torch.stack([
-		torch.stack([plU0, plV0], dim=1),
-		torch.stack([plU1, plV0], dim=1),
-		torch.stack([plU1, plV1], dim=1),
-		torch.stack([plU0, plV1], dim=1),
-	], dim=1)
-	uvs = uvCorners.reshape(N * 4, 2)
-
-	base = torch.arange(N, device=DEVICE, dtype=torch.int32) * 4
-	tri0 = torch.stack([base, base + 1, base + 2], dim=1)
-	tri1 = torch.stack([base, base + 2, base + 3], dim=1)
-	indices = torch.cat([tri0, tri1], dim=1).reshape(N * 2, 3)
-
-	return positions, uvs, indices
+	return (
+		cornerSliceIdx.reshape(N * 4).to(torch.uint16),
+		depth.reshape(N * 4),
+		cornerSourceX.reshape(N * 4).to(torch.uint16),
+		cornerSourceY.reshape(N * 4).to(torch.uint16),
+		cornerAtlasX.reshape(N * 4).to(torch.uint16),
+		cornerAtlasY.reshape(N * 4).to(torch.uint16),
+	)
 
 def replace_gt_color(slices, image, outfilledWidth, outfilledHeight, orgWidth, orgHeight):
 
@@ -491,21 +434,16 @@ def replace_gt_color(slices, image, outfilledWidth, outfilledHeight, orgWidth, o
 
 	return slices
 
-def save_outputs(outGLB, glbData):
-	if outGLB is not None:
-		atlasCpu, positionsCpu, uvsCpu, indicesCpu = glbData
-		exporter.export_glb(atlasCpu, positionsCpu, uvsCpu, indicesCpu, outGLB)
-
 # ------------------------------------------- #
 
 def spatial_photo(
 	image: np.ndarray, 
 	gaussians: Gaussians3D, 
-	focalY: float, 
-	outGLB, 
+	focalY: float,
+	outputWidth: int,
+	outputHeight: int,
 	numSlices: int = 30,
 	blockSize: int = 64,
-	outfillAmount: float = 0.0,
 	opaqueOnly: bool = False
 ):
 
@@ -515,13 +453,16 @@ def spatial_photo(
 	# ---------------
 	orgHeight, orgWidth = image.shape[:2]
 
-	outfilledWidth  = math.floor((1 + outfillAmount) * orgWidth)
-	outfilledHeight = math.floor((1 + outfillAmount) * orgHeight)
-	outfilledWidth  = ((outfilledWidth  + blockSize - 1) // blockSize) * blockSize
-	outfilledHeight = ((outfilledHeight + blockSize - 1) // blockSize) * blockSize
-	aspect = outfilledWidth / outfilledHeight
+	if outputWidth % blockSize != 0 or outputHeight % blockSize != 0:
+		raise ValueError("Output dimensions must be multiples of blockSize")
 
-	fov  = 2 * math.atan(outfilledHeight / (2 * focalY))
+	uint16Max = np.iinfo(np.uint16).max
+	if numSlices - 1 > uint16Max or outputWidth > uint16Max or outputHeight > uint16Max:
+		raise ValueError("Slice and pixel coordinates must fit in uint16")
+
+	aspect = outputWidth / outputHeight
+
+	fov  = 2 * math.atan(outputHeight / (2 * focalY))
 	eye    = torch.tensor([0.0, 0.0, 0.0])
 	target = torch.tensor([0.0, 0.0, 1.0])
 	up     = torch.tensor([0.0, 1.0, 0.0])
@@ -529,7 +470,7 @@ def spatial_photo(
 	proj   = perspective(fov, aspect, 0.1, 1000.0)
 
 	settings = ddgs.Settings(
-		width=outfilledWidth, height=outfilledHeight,
+		width=outputWidth, height=outputHeight,
 		view=view, proj=proj,
 		focalX=focalY, focalY=focalY,
 		outputs=ddgs.RenderOutputs.COLOR | ddgs.RenderOutputs.ALPHA | ddgs.RenderOutputs.DEPTH,
@@ -573,49 +514,31 @@ def spatial_photo(
 
 	slices = replace_gt_color(
 		slices, image, 
-		outfilledWidth, outfilledHeight, orgWidth, orgHeight
+		outputWidth, outputHeight, orgWidth, orgHeight
 	)
 
 	# generate block atlas:
 	# ---------------
 	print('Generating block atlas...')
 
-	atlas, placements = generate_block_atlas(
+	atlas, blocks = generate_block_atlas(
 		slices, blockSize, opaqueOnly
 	)
 
-	# build geometry:
+	# build depth grid:
 	# ---------------
-	print('Building geometry...')
+	print('Building depth grid...')
 
-	zGrid = build_geometry(
-		placements, slices,
-		outfilledWidth, outfilledHeight,
-		focalY, aspect, numSlices, blockSize
+	zGrid = build_depth_grid(
+		blocks, slices,
+		outputWidth, outputHeight,
+		numSlices, blockSize
 	)
 
-	# compute render buffers:
+	# build format-independent vertices:
 	# ---------------
-	print('Computing render buffers...')
+	print('Building vertices...')
 
-	positions, uvs, indices = finish_geometry(
-		zGrid, placements,
-		outfilledWidth, outfilledHeight,
-		focalY, aspect, numSlices, blockSize
-	)
+	vertices = build_vertices(zGrid, blocks, blockSize)
 
-	atlasCpu     = atlas.cpu().numpy()
-	positionsCpu = positions.cpu().numpy()
-	uvsCpu       = uvs.cpu().numpy()
-	indicesCpu   = indices.cpu().numpy()
-
-	# dispatch saving on background thread:
-	# ---------------
-	print('Saving outputs...')
-	if outGLB is not None:
-		print(f'    - GLB: {outGLB}')
-
-	glbData = (atlasCpu, positionsCpu, uvsCpu, indicesCpu) if outGLB is not None else None
-	save_outputs(
-		outGLB, glbData
-	)
+	return atlas, vertices

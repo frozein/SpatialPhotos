@@ -90,24 +90,22 @@ static inline DCmat3 dc_mat3_scale(DCvec3 s)
 	return result;
 }
 
-//matches the top-left 3x3 of qm_quaternion_to_mat4(), i.e. the transpose of
-//the usual quaternion rotation matrix (q is stored xyzw)
 static inline DCmat3 dc_quat_to_mat3(DCvec4 q)
 {
 	DCmat3 result;
 
-	float x2  = q.x + q.x;
-	float y2  = q.y + q.y;
-	float z2  = q.z + q.z;
-	float xx2 = q.x * x2;
-	float xy2 = q.x * y2;
-	float xz2 = q.x * z2;
-	float yy2 = q.y * y2;
-	float yz2 = q.y * z2;
-	float zz2 = q.z * z2;
-	float sx2 = q.w * x2;
-	float sy2 = q.w * y2;
-	float sz2 = q.w * z2;
+	float x2  = q.y + q.y;
+	float y2  = q.z + q.z;
+	float z2  = q.w + q.w;
+	float xx2 = q.y * x2;
+	float xy2 = q.y * y2;
+	float xz2 = q.y * z2;
+	float yy2 = q.z * y2;
+	float yz2 = q.z * z2;
+	float zz2 = q.w * z2;
+	float sx2 = q.x * x2;
+	float sy2 = q.x * y2;
+	float sz2 = q.x * z2;
 
 	result.m[0][0] = 1.0f - (yy2 + zz2);
 	result.m[0][1] = xy2 - sz2;

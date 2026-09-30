@@ -1,15 +1,15 @@
-import os
+import math
 import torch
 from pathlib import Path
 
 from sharp.utils import io
 from sharp.models import (
     PredictorParams,
-    RGBGaussianPredictor,
     create_predictor,
 )
 from sharp.cli.predict import predict_image
 
+import exporter
 from spatial_photos import spatial_photo
 
 # ------------------------------------------- #
@@ -37,12 +37,13 @@ def predict(
 ):
 	# get list of input images:
 	# ---------------
+	inputIsFile = inputPath.is_file()
 	imagePaths = []
-	if inputPath.is_file():
+	if inputIsFile:
 		if inputPath.suffix in io.get_supported_image_extensions():
 			imagePaths = [inputPath]
 	else:
-		if outputPath.is_file():
+		if outputPath.is_file() or outputPath.suffix.lower() == ".glb":
 			log_error(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
 			return
 
@@ -67,33 +68,46 @@ def predict(
 
 	# process each image:
 	# ---------------
-	if not outputPath.is_file():
-		outputPath.mkdir(exist_ok=True, parents=True)
+	singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".glb"
+	outputDirectory = outputPath.parent if singleOutputFile else outputPath
+	outputDirectory.mkdir(exist_ok=True, parents=True)
 
 	for imagePath in imagePaths:
 		log_info(f"Predicting gaussians for {imagePath}")
 
 		image, _, focalY = io.load_rgb(imagePath)
 		height, width = image.shape[:2]
-		intrinsics = torch.tensor(
-			[
-				[focalY, 0, (width - 1) / 2.0, 0],
-				[0, focalY, (height - 1) / 2.0, 0],
-				[0, 0, 1, 0],
-				[0, 0, 0, 1],
-			],
-			device=DEVICE,
-			dtype=torch.float32,
-		)
 		gaussians = predict_image(gaussianPredictor, image, focalY, DEVICE)
 
 		log_info(f"Generating Spatial Photo for {imagePath}")
 
-		spatial_photo(
+		outputWidth = math.floor((1 + outfillAmount) * width)
+		outputHeight = math.floor((1 + outfillAmount) * height)
+		outputWidth = ((outputWidth + blockSize - 1) // blockSize) * blockSize
+		outputHeight = ((outputHeight + blockSize - 1) // blockSize) * blockSize
+
+		atlas, vertices = spatial_photo(
 			image=image, 
 			gaussians=gaussians, 
-			focalY=focalY, 
-			outGLB="/Users/daniel/Downloads/test.glb"
+			focalY=focalY,
+			outputWidth=outputWidth,
+			outputHeight=outputHeight,
+			numSlices=numSlices,
+			blockSize=blockSize,
+			opaqueOnly=opaqueOnly,
+		)
+
+		outGLB = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.glb"
+		log_info(f"Saving Spatial Photo to {outGLB}")
+
+		exporter.export_glb(
+			atlas=atlas,
+			vertices=vertices,
+			imageWidth=outputWidth,
+			imageHeight=outputHeight,
+			focal=focalY,
+			blockSize=blockSize,
+			outPath=outGLB,
 		)
 
 predict(
