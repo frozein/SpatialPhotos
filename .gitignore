@@ -11,3 +11,8 @@
 
 # pycache
 **/__pycache__/
+# python venv
+.venv/
+test_out/
+
+*.DS_Store

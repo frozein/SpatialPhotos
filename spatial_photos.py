@@ -1,7 +1,6 @@
 import os
 import io
 import math
-import ddgs
 import numpy as np
 import torch
 import base64
@@ -18,13 +17,24 @@ import exporter
 
 # ------------------------------------------- #
 
+# the CUDA splat renderer where there is a GPU for it, the bundled CPU
+# renderer (same math, multithreaded) otherwise
+if torch.cuda.is_available():
+	import ddgs
+else:
+	import ddgs_cpu as ddgs
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ------------------------------------------- #
+
 OUTFILL_AMOUNT = 0.0
 
 DEPTH_MIN_QUANTILE = 0.0
 DEPTH_MAX_QUANTILE = 0.8
 NUM_SLICES = 30
 
-BLOCK_SIZE = 64
+BLOCK_SIZE = 32
 
 ALPHA_THRESHOLD = 1
 ALPHA_SOLID_THRESHOLD = 128
@@ -35,7 +45,7 @@ DEPTH_INFILL_OUTLIER_STD = 2.0
 ATLAS_MIN_SIZE = 64
 ATLAS_MAX_SIZE = 8192
 
-UV_PADDING = 0.5
+UV_PADDING = 1
 
 # ------------------------------------------- #
 
@@ -69,13 +79,13 @@ def perspective(fovy, aspect, znear, zfar):
 
 	return m
 
-def load_ply(path, device='cuda'):
+def load_ply(path, device=DEVICE):
 	data = PlyData.read(path)
 	vertex = data['vertex'].data
 
 	def np_to_torch(name, dim=1):
 		arr = np.stack([vertex[n] for n in name], axis=-1) if isinstance(name, (list, tuple)) else vertex[name]
-		return torch.tensor(arr, dtype=torch.float32, device='cuda')
+		return torch.tensor(arr, dtype=torch.float32, device=device)
 
 	means = np_to_torch(['x', 'y', 'z'])
 	colors = 0.5 + np_to_torch(['f_dc_0', 'f_dc_1', 'f_dc_2']) * 0.28209479177387814
@@ -212,8 +222,8 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 
 	N = len(meta)
 	if N == 0:
-		empty = torch.zeros((B, B, 4), dtype=torch.uint8, device='cuda')
-		return empty, [], (torch.zeros((B, B, 4), dtype=torch.uint8, device='cuda') if gtMasks is not None else None)
+		empty = torch.zeros((B, B, 4), dtype=torch.uint8, device=DEVICE)
+		return empty, [], (torch.zeros((B, B, 4), dtype=torch.uint8, device=DEVICE) if gtMasks is not None else None)
 
 	# find smallest square atlas:
 	# ---------------
@@ -222,10 +232,10 @@ def generate_block_atlas(slices, gtMasks=None, opaqueOnly=False):
 	atlasW = cols * B
 	atlasH = rows * B
 
-	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
+	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 	maskAtlas = None
 	if gtMasks is not None:
-		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
+		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
 	# pack atlas:
 	# ---------------
@@ -307,11 +317,11 @@ def generate_block_atlas_greedy(slices, gtMasks=None, opaqueOnly=False):
 	bin0 = packer.bin_list()[0]
 	atlasW, atlasH = bin0
 
-	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
+	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
 	maskAtlas = None
 	if gtMasks is not None:
-		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device='cuda')
+		maskAtlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
 	placements = []
 
@@ -387,8 +397,8 @@ def fill_block_depths(placements, slices):
 
 	# build list of blocks to process:
 	# ---------------
-	blocks = torch.zeros((N, B, B), dtype=torch.float32, device='cuda')
-	slicePositions = torch.zeros(N, dtype=torch.float32, device='cuda')
+	blocks = torch.zeros((N, B, B), dtype=torch.float32, device=DEVICE)
+	slicePositions = torch.zeros(N, dtype=torch.float32, device=DEVICE)
 
 	for i, (sliceIdx, px, py) in enumerate(keys):
 		_, depth, slicePos = slices[sliceIdx]
@@ -435,17 +445,17 @@ def build_geometry(placements, slices, width, height, focal, aspect):
 	GW = width  // BLOCK_SIZE
 	GH = height // BLOCK_SIZE
 
-	zGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device='cuda')
-	countGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device='cuda')
+	zGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device=DEVICE)
+	countGrid = torch.zeros((S, GH + 1, GW + 1), dtype=torch.float32, device=DEVICE)
 
-	plSliceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long, device='cuda')
-	plGx = torch.tensor([p[1] // BLOCK_SIZE for p in placements], dtype=torch.long, device='cuda')
-	plGy = torch.tensor([p[2] // BLOCK_SIZE for p in placements], dtype=torch.long, device='cuda')
+	plSliceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long, device=DEVICE)
+	plGx = torch.tensor([p[1] // BLOCK_SIZE for p in placements], dtype=torch.long, device=DEVICE)
+	plGy = torch.tensor([p[2] // BLOCK_SIZE for p in placements], dtype=torch.long, device=DEVICE)
 
-	cornerDGx = torch.tensor([0, 1, 0, 1], dtype=torch.long, device='cuda')
-	cornerDGy = torch.tensor([0, 0, 1, 1], dtype=torch.long, device='cuda')
-	cornerRow = torch.tensor([0, 0, BLOCK_SIZE-1, BLOCK_SIZE-1], dtype=torch.long, device='cuda')
-	cornerCol = torch.tensor([0, BLOCK_SIZE-1, 0, BLOCK_SIZE-1], dtype=torch.long, device='cuda')
+	cornerDGx = torch.tensor([0, 1, 0, 1], dtype=torch.long, device=DEVICE)
+	cornerDGy = torch.tensor([0, 0, 1, 1], dtype=torch.long, device=DEVICE)
+	cornerRow = torch.tensor([0, 0, BLOCK_SIZE-1, BLOCK_SIZE-1], dtype=torch.long, device=DEVICE)
+	cornerCol = torch.tensor([0, BLOCK_SIZE-1, 0, BLOCK_SIZE-1], dtype=torch.long, device=DEVICE)
 
 	cvx = (plGx.unsqueeze(1) + cornerDGx.unsqueeze(0)).clamp(max=GW)
 	cvy = (plGy.unsqueeze(1) + cornerDGy.unsqueeze(0)).clamp(max=GH)
@@ -488,8 +498,8 @@ def finish_geometry(zGrid, placements, width, height, focal, aspect):
 
 	# compute worldspace vertex coordinates:
 	# ---------------
-	gxCoords = torch.arange(GW + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
-	gyCoords = torch.arange(GH + 1, device='cuda', dtype=torch.float32) * BLOCK_SIZE
+	gxCoords = torch.arange(GW + 1, device=DEVICE, dtype=torch.float32) * BLOCK_SIZE
+	gyCoords = torch.arange(GH + 1, device=DEVICE, dtype=torch.float32) * BLOCK_SIZE
 
 	xOffset = gxCoords - width  * 0.5
 	yOffset = height * 0.5 - gyCoords
@@ -502,13 +512,13 @@ def finish_geometry(zGrid, placements, width, height, focal, aspect):
 
 	# compute positions and uvs:
 	# ---------------
-	plSiceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long,   device='cuda')
-	plPx      = torch.tensor([p[1] for p in placements], dtype=torch.long,   device='cuda')
-	plPy      = torch.tensor([p[2] for p in placements], dtype=torch.long,   device='cuda')
-	plU0      = torch.tensor([p[3] for p in placements], dtype=torch.float32, device='cuda')
-	plV0      = torch.tensor([p[4] for p in placements], dtype=torch.float32, device='cuda')
-	plU1      = torch.tensor([p[5] for p in placements], dtype=torch.float32, device='cuda')
-	plV1      = torch.tensor([p[6] for p in placements], dtype=torch.float32, device='cuda')
+	plSiceIdx = torch.tensor([p[0] for p in placements], dtype=torch.long,   device=DEVICE)
+	plPx      = torch.tensor([p[1] for p in placements], dtype=torch.long,   device=DEVICE)
+	plPy      = torch.tensor([p[2] for p in placements], dtype=torch.long,   device=DEVICE)
+	plU0      = torch.tensor([p[3] for p in placements], dtype=torch.float32, device=DEVICE)
+	plV0      = torch.tensor([p[4] for p in placements], dtype=torch.float32, device=DEVICE)
+	plU1      = torch.tensor([p[5] for p in placements], dtype=torch.float32, device=DEVICE)
+	plV1      = torch.tensor([p[6] for p in placements], dtype=torch.float32, device=DEVICE)
 
 	gx0 = plPx // BLOCK_SIZE
 	gy0 = plPy // BLOCK_SIZE
@@ -533,7 +543,7 @@ def finish_geometry(zGrid, placements, width, height, focal, aspect):
 	], dim=1)
 	uvs = uvCorners.reshape(N * 4, 2)
 
-	base = torch.arange(N, device='cuda', dtype=torch.int32) * 4
+	base = torch.arange(N, device=DEVICE, dtype=torch.int32) * 4
 	tri0 = torch.stack([base, base + 1, base + 2], dim=1)
 	tri1 = torch.stack([base, base + 2, base + 3], dim=1)
 	indices = torch.cat([tri0, tri1], dim=1).reshape(N * 2, 3)
@@ -544,7 +554,7 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 
 	orgRGB = torch.tensor(
 		np.flip(np.array(orgImage.convert("RGB"), dtype=np.uint8), axis=1).copy(),
-		device='cuda'
+		device=DEVICE
 	)
 
 	alphaStack = torch.stack([
@@ -560,13 +570,13 @@ def replace_gt_color(slices, orgImage, outfilledWidth, outfilledHeight, orgWidth
 	offY = (outfilledHeight - orgHeight) // 2
 	H, W = outfilledHeight, outfilledWidth
 
-	yy = torch.arange(H, device='cuda').unsqueeze(1).expand(H, W)
-	xx = torch.arange(W, device='cuda').unsqueeze(0).expand(H, W)
+	yy = torch.arange(H, device=DEVICE).unsqueeze(1).expand(H, W)
+	xx = torch.arange(W, device=DEVICE).unsqueeze(0).expand(H, W)
 
 	insideGT = (xx >= offX) & (xx < offX + orgWidth) & (yy >= offY) & (yy < offY + orgHeight)
 
 	S = len(slices)
-	gtMask = torch.zeros((S, H, W), dtype=torch.bool, device='cuda')
+	gtMask = torch.zeros((S, H, W), dtype=torch.bool, device=DEVICE)
 
 	for s in range(S):
 		mask = (firstHit == s) & hitAny & insideGT
@@ -650,7 +660,7 @@ def spatial_photo(orgImagePath, plyPath, outGLB, outStereoImages,
                   greedy=False, opaqueOnly=False, skipExisting=False,
                   saveFuture=None, saveExecutor=None):
 
-	torch.set_default_device('cuda')
+	torch.set_default_device(DEVICE)
 
 	# skip if all outputs already exist:
 	# ---------------

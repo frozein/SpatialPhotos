@@ -1,0 +1,3 @@
+-I./csrc/include
+-std=c++17
+-xc++
