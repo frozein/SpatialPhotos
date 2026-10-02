@@ -554,8 +554,10 @@ def spatial_photo(
 				)
 			)
 
-		img = torch.cat([render.color, render.alpha], dim=-1)
-		img = (linear_to_srgb(img) * 255).to(torch.uint8)
+		alpha = render.alpha
+		rgb = linear_to_srgb(render.color / alpha.clamp_min(1e-8)) * alpha
+		img = torch.cat([rgb, alpha], dim=-1)
+		img = (img * 255).to(torch.uint8)
 
 		render.depth[render.depth > zMax] = zMax
 		render.depth[(render.depth < zMin) & (render.depth > 0)] = zMin
