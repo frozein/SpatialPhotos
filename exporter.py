@@ -1,5 +1,7 @@
 import io
+import struct
 from os import PathLike
+from pathlib import Path
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -29,6 +31,9 @@ NumpyVertexFields: TypeAlias = tuple[
 	np.ndarray,
 ]
 RenderBuffers: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
+
+SPM_MAGIC = b"SPM\x01"
+SPM_HEADER = struct.Struct("<4s4If3If4I")
 
 # ------------------------------------------- #
 
@@ -160,15 +165,6 @@ def export_glb(
 	imageFormat: str = "WEBP"
 ) -> None:
 
-	# validate:
-	# ---------------
-	if min(imageWidth, imageHeight, blockSize) <= 0:
-		raise ValueError("image dimensions and blockSize must be positive")
-	if not np.isfinite(focal) or focal <= 0:
-		raise ValueError("focal must be positive and finite")
-	if uvPadding < 0 or uvPadding * 2 >= blockSize:
-		raise ValueError("uvPadding must be nonnegative and less than half the block size")
-
 	# build render buffers:
 	# ---------------
 	atlas = to_numpy(atlas, np.uint8)
@@ -249,3 +245,75 @@ def export_glb(
 	# save:
 	# ---------------
 	model.save_binary(outPath)
+
+def export_spm(
+	atlas: Any,
+	vertices: VertexFields,
+	imageWidth: int,
+	imageHeight: int,
+	focal: float,
+	blockSize: int,
+	outPath: str | PathLike[str],
+	uvPadding: float = 1,
+	imageFormat: str = "WEBP",
+	numSlices: int | None = None,
+	opaqueOnly: bool = False,
+) -> None:
+
+	# unpack fields:
+	# ---------------
+	imageFormat = imageFormat.upper()
+	atlas = to_numpy(atlas, np.uint8)
+	atlasHeight, atlasWidth = atlas.shape[:2]
+	sliceIdx, depth, sourceX, sourceY, atlasX, atlasY = get_vertex_fields(vertices)
+	sliceIdx, sourceX, sourceY, atlasX, atlasY = [
+		field.astype(np.int64).reshape(-1, 4) for field in (sliceIdx, sourceX, sourceY, atlasX, atlasY)
+	]
+	if numSlices is None:
+		numSlices = int(sliceIdx.max()) + 1 if sliceIdx.size else 1
+
+	# compute metadata:
+	# ---------------
+	gridWidth, gridHeight = imageWidth // blockSize, imageHeight // blockSize
+	cornerSlots = (gridWidth + 1) * (gridHeight + 1)
+	blockSlots = gridWidth * gridHeight
+	cornerKeys = (sliceIdx * cornerSlots + sourceY // blockSize * (gridWidth + 1) + sourceX // blockSize).reshape(-1)
+	uniqueKeys, first = np.unique(cornerKeys, return_index=True)
+	cornerDepths = depth[first]
+	blockKeys = sliceIdx[:, 3] * blockSlots + sourceY[:, 3] // blockSize * gridWidth + sourceX[:, 3] // blockSize
+	order = np.argsort(blockKeys)
+	blockKeys = blockKeys[order]
+	atlasCoords = np.column_stack((atlasX[:, 3], atlasY[:, 3]))[order] // blockSize
+	
+	# compute bitmasks, write vertex + block lists:
+	# ---------------
+	chunks: list[bytes] = []
+	for s in range(numSlices):
+		v0, v1 = np.searchsorted(uniqueKeys, [s * cornerSlots, (s + 1) * cornerSlots])
+		b0, b1 = np.searchsorted(blockKeys, [s * blockSlots, (s + 1) * blockSlots])
+		cornerMask = np.zeros(cornerSlots, dtype=np.uint8)
+		cornerMask[uniqueKeys[v0:v1] - s * cornerSlots] = 1
+		blockMask = np.zeros(blockSlots, dtype=np.uint8)
+		blockMask[blockKeys[b0:b1] - s * blockSlots] = 1
+		chunks.extend((
+			struct.pack("<II", v1 - v0, b1 - b0),
+			np.packbits(cornerMask, bitorder="little").tobytes(),
+			cornerDepths[v0:v1].astype("<f4").tobytes(),
+			np.packbits(blockMask, bitorder="little").tobytes(),
+			atlasCoords[b0:b1].astype(np.uint8).tobytes(),
+		))
+
+	# pack everything together:
+	# ---------------
+	geometry = b"".join(chunks)
+	imageBytes = io.BytesIO()
+	Image.fromarray(atlas).save(imageBytes, format=imageFormat, **IMAGE_OPTIONS[imageFormat])
+	imageBytes = imageBytes.getvalue()
+	flags = int(bool(opaqueOnly)) | (2 if imageFormat == "PNG" else 0)
+	header = SPM_HEADER.pack(
+		SPM_MAGIC, imageWidth, imageHeight, numSlices, blockSize,
+		focal, atlasWidth, atlasHeight, flags, uvPadding,
+		len(uniqueKeys), len(blockKeys), len(geometry), len(imageBytes),
+	)
+
+	Path(outPath).write_bytes(header + geometry + imageBytes)

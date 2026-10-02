@@ -175,14 +175,18 @@ def greedy_mesh(mask: np.ndarray) -> list[Rectangle]:
 
 	return rectsOut
 
-def pack_blocks(patchDims: Sequence[PatchDimensions]) -> PackerBBF:
+def pack_blocks(
+	patchDims: Sequence[PatchDimensions],
+	minSize: int = ATLAS_MIN_SIZE,
+	maxSize: int = ATLAS_MAX_SIZE,
+) -> PackerBBF:
 	minRequiredSize = max(
 		max(max(width, height) for width, height in patchDims),
 		math.ceil(math.sqrt(sum(width * height for width, height in patchDims))),
 	)
 
-	if minRequiredSize > ATLAS_MAX_SIZE:
-		raise ValueError("Block atlas exceeds ATLAS_MAX_SIZE")
+	if minRequiredSize > maxSize:
+		raise ValueError("Block atlas exceeds the atlas size limit")
 
 	# binary search to find best size:
 	# ---------------
@@ -196,8 +200,8 @@ def pack_blocks(patchDims: Sequence[PatchDimensions]) -> PackerBBF:
 
 		return len(packer.rect_list()) == len(patchDims)
 
-	low = max(ATLAS_MIN_SIZE, minRequiredSize)
-	high = ATLAS_MAX_SIZE
+	low = max(minSize, minRequiredSize)
+	high = maxSize
 	bestSize = None
 
 	while low <= high:
@@ -209,7 +213,7 @@ def pack_blocks(patchDims: Sequence[PatchDimensions]) -> PackerBBF:
 			low = mid + 1
 
 	if bestSize is None:
-		raise ValueError("Could not pack blocks within ATLAS_MAX_SIZE")
+		raise ValueError("Could not pack blocks within the atlas size limit")
 
 	# pack using best size:
 	# ---------------
@@ -225,7 +229,8 @@ def pack_blocks(patchDims: Sequence[PatchDimensions]) -> PackerBBF:
 def generate_block_atlas(
 	slices: Sequence[SpatialSlice],
 	blockSize: int, 
-	opaqueOnly: bool
+	opaqueOnly: bool,
+	atlasBlockLimit: int | None = None,
 ) -> tuple[torch.Tensor, list[BlockPlacement]]:
 	sourceOrigins: list[tuple[int, int, int]] = []
 	patchDims: list[PatchDimensions] = []
@@ -246,17 +251,24 @@ def generate_block_atlas(
 
 		for gx, gy, gw, gh in greedy_mesh(presentCpu):
 			sourceOrigins.append((sliceIdx, gx * blockSize, gy * blockSize))
-			patchDims.append((gw * blockSize, gh * blockSize))
+			patchDims.append((gw, gh))
 
 	if not patchDims:
 		raise ValueError("No visible blocks were found in the rendered slices")
 
 	# pack greedy meshed rects:
 	# ---------------
-	packer = pack_blocks(patchDims)
+	maxBlocks = ATLAS_MAX_SIZE // blockSize
+	if atlasBlockLimit is not None:
+		maxBlocks = min(maxBlocks, atlasBlockLimit)
+	packer = pack_blocks(
+		patchDims,
+		minSize=math.ceil(ATLAS_MIN_SIZE / blockSize),
+		maxSize=maxBlocks,
+	)
 
 	bin0 = packer.bin_list()[0]
-	atlasW, atlasH = bin0
+	atlasW, atlasH = (size * blockSize for size in bin0)
 
 	atlas = torch.zeros((atlasH, atlasW, 4), dtype=torch.uint8, device=DEVICE)
 
@@ -264,6 +276,9 @@ def generate_block_atlas(
 
 	for rect in packer.rect_list():
 		_, atlasX, atlasY, patchWidth, patchHeight, i = rect
+		atlasX, atlasY, patchWidth, patchHeight = (
+			value * blockSize for value in (atlasX, atlasY, patchWidth, patchHeight)
+		)
 
 		sliceIdx, sourceX, sourceY = sourceOrigins[i]
 		img, _, _ = slices[sliceIdx]
@@ -393,6 +408,9 @@ def build_depth_grid(
 	zGrid[hasData] = zGrid[hasData] / countGrid[hasData]
 
 	zGrid, _ = zGrid.cummax(dim=0)
+	depths = zGrid.reshape(-1)[flatIdx]
+	if not torch.all(torch.isfinite(depths) & (depths > 0)):
+		raise ValueError("Depth grid generation produced nonpositive or nonfinite depths")
 
 	return zGrid
 
@@ -490,33 +508,15 @@ def spatial_photo(
 	outputHeight: int,
 	numSlices: int = 30,
 	blockSize: int = 64,
-	opaqueOnly: bool = False
+	opaqueOnly: bool = False,
+	atlasBlockLimit: int | None = None,
 ) -> tuple[torch.Tensor, VertexFields]:
 	
-	# validate:
-	# ---------------
-	if image.ndim != 3 or image.shape[2] != 3:
-		raise ValueError("image must have shape (H, W, 3)")
-	if not math.isfinite(focalY) or focalY <= 0:
-		raise ValueError("focalY must be positive and finite")
-	if min(outputWidth, outputHeight, numSlices, blockSize) <= 0:
-		raise ValueError("output dimensions, numSlices, and blockSize must be positive")
-
 	torch.set_default_device(DEVICE)
 
 	# compute dimensions + settings:
 	# ---------------
 	orgHeight, orgWidth = image.shape[:2]
-	if outputWidth < orgWidth or outputHeight < orgHeight:
-		raise ValueError("output dimensions must contain the input image")
-
-	if outputWidth % blockSize != 0 or outputHeight % blockSize != 0:
-		raise ValueError("Output dimensions must be multiples of blockSize")
-
-	uint16Max = np.iinfo(np.uint16).max
-	if numSlices - 1 > uint16Max or outputWidth > uint16Max or outputHeight > uint16Max:
-		raise ValueError("Slice and pixel coordinates must fit in uint16")
-
 	aspect = outputWidth / outputHeight
 
 	fov  = 2 * math.atan(outputHeight / (2 * focalY))
@@ -535,9 +535,6 @@ def spatial_photo(
 	)
 
 	means = gaussians.mean_vectors.flatten(0, 1)
-	if len(means) == 0:
-		raise ValueError("gaussians must not be empty")
-
 	zMin  = torch.quantile(means[:, 2], DEPTH_MIN_QUANTILE).item()
 	zMax  = torch.quantile(means[:, 2], DEPTH_MAX_QUANTILE).item()
 
@@ -582,7 +579,7 @@ def spatial_photo(
 	print('Generating block atlas...')
 
 	atlas, blocks = generate_block_atlas(
-		slices, blockSize, opaqueOnly
+		slices, blockSize, opaqueOnly, atlasBlockLimit
 	)
 
 	# build depth grid:
