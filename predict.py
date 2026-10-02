@@ -38,7 +38,7 @@ def predict(
 	outputFormat: str = "SPM",
 	uvPadding: int = 1,
 	checkpointPath: Path = CHECKPOINT_PATH,
-	quality: int | None = None,
+	quality: int = 75,
 ) -> None:
 
 	# validate:
@@ -55,10 +55,14 @@ def predict(
 		raise ValueError("outfillAmount must be nonnegative and finite")
 	if outputFormat not in ("SPM", "GLB"):
 		raise ValueError("outputFormat must be SPM or GLB")
+	if inputPath.is_file() and outputPath.suffix.lower() in (".glb", ".spm"):
+		outputFormat = outputPath.suffix[1:].upper()
+	if outputFormat == "SPM" and blockSize % 8:
+		raise ValueError("SPM blockSize must be a multiple of 8 for JPEG block alignment")
 	if not math.isfinite(uvPadding) or uvPadding < 0 or uvPadding * 2 >= blockSize:
 		raise ValueError("uvPadding must be nonnegative and less than half the block size")
-	if quality is not None and not 0 <= quality <= 100:
-		raise ValueError("quality must be between 0 and 100, or None for lossless")
+	if not 0 <= quality <= 100:
+		raise ValueError("quality must be between 0 and 100")
 
 	# get list of input images:
 	# ---------------
@@ -94,8 +98,6 @@ def predict(
 	# process each image:
 	# ---------------
 	singleOutputFile = inputIsFile and outputPath.suffix.lower() in (".glb", ".spm")
-	if singleOutputFile:
-		outputFormat = outputPath.suffix[1:].upper()
 	outputDirectory = outputPath.parent if singleOutputFile else outputPath
 	outputDirectory.mkdir(exist_ok=True, parents=True)
 
@@ -159,7 +161,7 @@ if __name__ == "__main__":
 	parser.add_argument("--uv-padding", type=int, default=1)
 	parser.add_argument("--opaque-only", action="store_true")
 	parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
-	parser.add_argument("--quality", type=int, help="SPM WebP color quality 0–100; omitted means lossless. Alpha is always lossless.")
+	parser.add_argument("--quality", type=int, default=75, help="SPM JPEG 4:4:4 color quality 0–100 (default: 75). Alpha is always lossless WebP.")
 	args = parser.parse_args()
 	
 	predict(
