@@ -4,15 +4,11 @@ from typing import TypeAlias
 
 import numpy as np
 import torch
+import ddgs_cpu as ddgs # custom CPU splat renderer
 import rectpack
 from rectpack.packer import PackerBBF
 
 from sharp.utils.gaussians import Gaussians3D
-
-if torch.cuda.is_available():
-	import ddgs
-else:
-	import ddgs_cpu as ddgs
 
 # ------------------------------------------- #
 
