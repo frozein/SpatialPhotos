@@ -10,15 +10,7 @@ from PIL import Image
 
 # ------------------------------------------- #
 
-IMAGE_OPTIONS = {
-	"WEBP": dict(lossless=True, quality=75, method=4, exact=True),
-	"PNG":  dict(optimize=True),
-}
-MIME_TYPES = {
-	"WEBP": "image/webp",
-	"PNG":  "image/png",
-	"JPEG": "image/jpeg",
-}
+GLB_WEBP_OPTIONS = dict(lossless=True, quality=75, method=4, exact=True)
 WEBP_EXTENSION = "EXT_texture_webp"
 
 VertexFields: TypeAlias = tuple[Any, Any, Any, Any, Any, Any]
@@ -32,8 +24,8 @@ NumpyVertexFields: TypeAlias = tuple[
 ]
 RenderBuffers: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
 
-SPM_MAGIC = b"SPM\x01"
-SPM_HEADER = struct.Struct("<4s4If3If4I")
+SPM_MAGIC = b"SPM\x02"
+SPM_HEADER = struct.Struct("<4s4If3If5I")
 
 # ------------------------------------------- #
 
@@ -162,7 +154,6 @@ def export_glb(
 	blockSize: int,
 	outPath: str | PathLike[str],
 	uvPadding: int = 1,
-	imageFormat: str = "WEBP"
 ) -> None:
 
 	# build render buffers:
@@ -183,7 +174,7 @@ def export_glb(
 	imgBytes = io.BytesIO()
 
 	atlasImg = Image.fromarray(atlas)
-	atlasImg.save(imgBytes, format=imageFormat, **IMAGE_OPTIONS.get(imageFormat, {}))
+	atlasImg.save(imgBytes, format="WEBP", **GLB_WEBP_OPTIONS)
 	imgBytes = imgBytes.getvalue()
 
 	# define GLTF structure:
@@ -199,12 +190,10 @@ def export_glb(
 		imgBytes
 	)
 
-	isWebp = imageFormat == "WEBP"
-
 	model = gltf.GLTF2(
 		asset=gltf.Asset(version="2.0"),
-		extensionsUsed=[WEBP_EXTENSION] if isWebp else [],
-		extensionsRequired=[WEBP_EXTENSION] if isWebp else [],
+		extensionsUsed=[WEBP_EXTENSION],
+		extensionsRequired=[WEBP_EXTENSION],
 		buffers=[gltf.Buffer(byteLength=len(binBlob))],
 		bufferViews=[
 			gltf.BufferView(buffer=0, byteOffset=0, byteLength=positions.nbytes, target=gltf.ARRAY_BUFFER),
@@ -217,9 +206,9 @@ def export_glb(
 			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs), type="VEC2"),
 			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices.flat), type="SCALAR")
 		],
-		images=[gltf.Image(bufferView=3, mimeType=MIME_TYPES[imageFormat])],
+		images=[gltf.Image(bufferView=3, mimeType="image/webp")],
 		textures=[
-			gltf.Texture(extensions={WEBP_EXTENSION: {"source": 0}}) if isWebp else gltf.Texture(source=0)
+			gltf.Texture(extensions={WEBP_EXTENSION: {"source": 0}})
 		],
 		materials=[gltf.Material(
 			pbrMetallicRoughness=gltf.PbrMetallicRoughness(
@@ -246,6 +235,27 @@ def export_glb(
 	# ---------------
 	model.save_binary(outPath)
 
+# ------------------------------------------- #
+
+def split_atlas(atlas: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+	alpha = atlas[..., 3]
+	color = np.zeros(atlas.shape[:2] + (3,), dtype=np.float32)
+	np.divide(atlas[..., :3].astype(np.float32) * 255, alpha[..., None],
+		out=color, where=alpha[..., None] > 0)
+
+	return np.rint(color).clip(0, 255).astype(np.uint8), alpha
+
+def encode_color(color: np.ndarray, quality: int | None = None) -> bytes:
+	buffer = io.BytesIO()
+	Image.fromarray(color).save(buffer, format="WEBP", lossless=quality is None,
+		quality=100 if quality is None else quality, method=6)
+	return buffer.getvalue()
+
+def encode_alpha(alpha: np.ndarray) -> bytes:
+	buffer = io.BytesIO()
+	Image.fromarray(alpha).save(buffer, format="WEBP", lossless=True, quality=100, method=6, exact=True)
+	return buffer.getvalue()
+
 def export_spm(
 	atlas: Any,
 	vertices: VertexFields,
@@ -255,14 +265,13 @@ def export_spm(
 	blockSize: int,
 	outPath: str | PathLike[str],
 	uvPadding: float = 1,
-	imageFormat: str = "WEBP",
 	numSlices: int | None = None,
 	opaqueOnly: bool = False,
+	quality: int | None = None,
 ) -> None:
 
 	# unpack fields:
 	# ---------------
-	imageFormat = imageFormat.upper()
 	atlas = to_numpy(atlas, np.uint8)
 	atlasHeight, atlasWidth = atlas.shape[:2]
 	sliceIdx, depth, sourceX, sourceY, atlasX, atlasY = get_vertex_fields(vertices)
@@ -306,14 +315,16 @@ def export_spm(
 	# pack everything together:
 	# ---------------
 	geometry = b"".join(chunks)
-	imageBytes = io.BytesIO()
-	Image.fromarray(atlas).save(imageBytes, format=imageFormat, **IMAGE_OPTIONS[imageFormat])
-	imageBytes = imageBytes.getvalue()
-	flags = int(bool(opaqueOnly)) | (2 if imageFormat == "PNG" else 0)
+
+	color, alpha = split_atlas(atlas)
+	colorBytes = encode_color(color, quality)
+	alphaBytes = encode_alpha(alpha)
+
+	flags = int(bool(opaqueOnly))
 	header = SPM_HEADER.pack(
 		SPM_MAGIC, imageWidth, imageHeight, numSlices, blockSize,
 		focal, atlasWidth, atlasHeight, flags, uvPadding,
-		len(uniqueKeys), len(blockKeys), len(geometry), len(imageBytes),
+		len(uniqueKeys), len(blockKeys), len(geometry), len(colorBytes), len(alphaBytes),
 	)
 
-	Path(outPath).write_bytes(header + geometry + imageBytes)
+	Path(outPath).write_bytes(header + geometry + colorBytes + alphaBytes)

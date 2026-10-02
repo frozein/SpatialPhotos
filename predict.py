@@ -38,6 +38,7 @@ def predict(
 	outputFormat: str = "SPM",
 	uvPadding: int = 1,
 	checkpointPath: Path = CHECKPOINT_PATH,
+	quality: int | None = None,
 ) -> None:
 
 	# validate:
@@ -56,6 +57,8 @@ def predict(
 		raise ValueError("outputFormat must be SPM or GLB")
 	if not math.isfinite(uvPadding) or uvPadding < 0 or uvPadding * 2 >= blockSize:
 		raise ValueError("uvPadding must be nonnegative and less than half the block size")
+	if quality is not None and not 0 <= quality <= 100:
+		raise ValueError("quality must be between 0 and 100, or None for lossless")
 
 	# get list of input images:
 	# ---------------
@@ -142,7 +145,7 @@ def predict(
 			blockSize=blockSize,
 			outPath=outFile,
 			uvPadding=uvPadding,
-			**({"numSlices": numSlices, "opaqueOnly": opaqueOnly} if outputFormat == "SPM" else {}),
+			**({"numSlices": numSlices, "opaqueOnly": opaqueOnly, "quality": quality} if outputFormat == "SPM" else {}),
 		)
 
 if __name__ == "__main__":
@@ -156,10 +159,12 @@ if __name__ == "__main__":
 	parser.add_argument("--uv-padding", type=int, default=1)
 	parser.add_argument("--opaque-only", action="store_true")
 	parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
+	parser.add_argument("--quality", type=int, help="SPM WebP color quality 0–100; omitted means lossless. Alpha is always lossless.")
 	args = parser.parse_args()
 	
 	predict(
 		args.input, args.output, numSlices=args.slices, blockSize=args.block_size,
 		outfillAmount=args.outfill, opaqueOnly=args.opaque_only, outputFormat=args.format,
 		uvPadding=args.uv_padding, checkpointPath=args.checkpoint,
+		quality=args.quality,
 	)
