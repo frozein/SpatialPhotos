@@ -24,7 +24,7 @@ NumpyVertexFields: TypeAlias = tuple[
 ]
 RenderBuffers: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
 
-SPM_MAGIC = b"SPM\x03"
+SPM_MAGIC = b"SPM\x04"
 SPM_HEADER = struct.Struct("<4s4If3If5I")
 
 # ------------------------------------------- #
@@ -251,9 +251,10 @@ def encode_color(color: np.ndarray, quality: int = 75) -> bytes:
 		subsampling=0, optimize=True, progressive=False)
 	return buffer.getvalue()
 
-def encode_alpha(alpha: np.ndarray) -> bytes:
+def encode_alpha(alpha: np.ndarray, quality: int = 75) -> bytes:
 	buffer = io.BytesIO()
-	Image.fromarray(alpha).save(buffer, format="WEBP", lossless=True, quality=100, method=6, exact=True)
+	Image.fromarray(alpha).save(buffer, format="JPEG", quality=quality,
+		optimize=True, progressive=False)
 	return buffer.getvalue()
 
 def export_spm(
@@ -318,7 +319,7 @@ def export_spm(
 
 	color, alpha = split_atlas(atlas)
 	colorBytes = encode_color(color, quality)
-	alphaBytes = encode_alpha(alpha)
+	alphaBytes = encode_alpha(alpha, quality)
 
 	flags = int(bool(opaqueOnly))
 	header = SPM_HEADER.pack(

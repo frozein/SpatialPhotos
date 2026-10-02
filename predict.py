@@ -161,7 +161,7 @@ if __name__ == "__main__":
 	parser.add_argument("--uv-padding", type=int, default=1)
 	parser.add_argument("--opaque-only", action="store_true")
 	parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
-	parser.add_argument("--quality", type=int, default=75, help="SPM JPEG 4:4:4 color quality 0–100 (default: 75). Alpha is always lossless WebP.")
+	parser.add_argument("--quality", type=int, default=75, help="SPM JPEG quality 0–100 for color and grayscale alpha (default: 75). Both are lossy.")
 	args = parser.parse_args()
 	
 	predict(
