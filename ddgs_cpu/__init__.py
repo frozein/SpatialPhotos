@@ -1,17 +1,8 @@
 """Multithreaded CPU renderer for 3D gaussian splats, forward pass only.
 
-This is a drop-in replacement for the rendering half of the CUDA `ddgs` module,
-for machines without an NVIDIA GPU:
-
-	import ddgs_cpu as ddgs
-
-The splatting math is transcribed from the DDGS CUDA kernels, so renders match
-what the GPU produces (up to floating point ordering). There is no backward
-pass, so no gradients: inputs are detached before rendering.
-
-The C++ extension is compiled on first import and cached in
-~/.cache/torch_extensions, which needs a working C++ toolchain (Xcode command
-line tools on macOS) and `ninja`.
+Build with `python -m ddgs_cpu`. The C++ extension is cached by PyTorch 
+and also builds automatically on first render if needed. Building 
+needs a C++17 compiler (Xcode command line tools on macOS) and `ninja`.
 """
 
 import math
@@ -31,7 +22,7 @@ _CSRC_DIR = os.path.join(_ROOT_DIR, "csrc")
 
 _extension = None
 
-def _load_extension():
+def _load_extension(*, verbose=None):
 	global _extension
 
 	if _extension is not None:
@@ -51,19 +42,22 @@ def _load_extension():
 		from torch.utils.cpp_extension import _get_build_directory
 
 		buildDir = _get_build_directory(_MODULE_NAME, verbose=False)
-		needsBuild = not os.path.isfile(os.path.join(buildDir, f"{_MODULE_NAME}.so"))
+		suffix = ".pyd" if os.name == "nt" else ".so"
+		needsBuild = not os.path.isfile(os.path.join(buildDir, f"{_MODULE_NAME}{suffix}"))
 	except Exception:
 		pass
 
 	if needsBuild:
-		print("ddgs_cpu: compiling the CPU renderer, this only happens once...")
+		print("ddgs_cpu: compiling the CPU renderer (no CUDA required)...", flush=True)
 
 	_extension = load(
 		name=_MODULE_NAME,
 		sources=sources,
 		extra_include_paths=[os.path.join(_CSRC_DIR, "include")],
-		extra_cflags=["-O3", "-std=c++17", "-fno-math-errno", "-funroll-loops"],
-		verbose=os.environ.get("DDGS_CPU_VERBOSE", "0") == "1",
+		extra_cflags=(["/O2", "/std:c++17"] if os.name == "nt" else
+					  ["-O3", "-std=c++17", "-fno-math-errno", "-funroll-loops"]),
+		with_cuda=False,
+		verbose=os.environ.get("DDGS_CPU_VERBOSE", "0") == "1" if verbose is None else verbose,
 	)
 
 	return _extension

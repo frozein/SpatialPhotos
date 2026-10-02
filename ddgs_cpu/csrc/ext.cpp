@@ -4,7 +4,6 @@
  */
 
 #include <torch/extension.h>
-
 #include <tuple>
 
 #include "ddgs_cpu.h"

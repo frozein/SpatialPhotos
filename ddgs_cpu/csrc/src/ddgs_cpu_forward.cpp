@@ -17,8 +17,7 @@
 
 namespace {
 
-//per-gaussian data produced by the preprocess pass, everything the
-//rasterizer needs and nothing else
+//per-gaussian data produced by the preprocess pass
 struct DCsplat
 {
 	float centerX, centerY;
@@ -55,10 +54,6 @@ static inline uint32_t _ddgs_cpu_thread_count(uint32_t requested, uint64_t numCh
 	return (uint32_t)std::min<uint64_t>(threads, numChunks == 0 ? 1 : numChunks);
 }
 
-/* calls body(begin, end) over chunks of [0, count), handing chunks out
- * dynamically so that uneven work (tiles hold wildly different numbers of
- * gaussians) still spreads evenly across threads
- */
 template<typename F>
 static void _ddgs_cpu_parallel(uint64_t count, uint64_t chunkSize, uint32_t requestedThreads, F&& body)
 {
@@ -104,9 +99,6 @@ static void _ddgs_cpu_parallel(uint64_t count, uint64_t chunkSize, uint32_t requ
 
 //-------------------------------------------//
 
-/* the tile range a gaussian's bounding box covers, transcribed from
- * _ddgs_get_tile_bounds(), including the truncating float to int casts
- */
 static inline void _ddgs_cpu_get_tile_bounds(uint32_t width, uint32_t height, DCvec2 pixCenter, float pixRadius,
                                              DCtileRange& outTiles)
 {
@@ -119,9 +111,6 @@ static inline void _ddgs_cpu_get_tile_bounds(uint32_t width, uint32_t height, DC
 	outTiles.maxY = (uint32_t)std::min(std::max((int32_t)((pixCenter.y + pixRadius + DDGS_CPU_TILE_SIZE - 1) / DDGS_CPU_TILE_SIZE), 0), tilesHeight);
 }
 
-/* projects one gaussian to screen space, returns false if it was culled
- * (transcribed from _ddgs_foward_preprocess_kernel)
- */
 static bool _ddgs_cpu_preprocess_one(const DDGSCPUsettings& settings, const DDGSCPUgaussians& gaussians, uint32_t idx,
                                      DCsplat& outSplat, DCtileRange& outTiles)
 {
@@ -204,8 +193,10 @@ static bool _ddgs_cpu_preprocess_one(const DDGSCPUsettings& settings, const DDGS
 
 	//write out:
 	//---------------
+
 	//NOTE: harmonics are read as plain rgb at a stride of 3, matching the CUDA
 	//renderer, which assumes a single (degree 0) band per gaussian
+
 	outSplat.centerX = pixCenter.x;
 	outSplat.centerY = pixCenter.y;
 	outSplat.conicX = conic.x;
@@ -222,9 +213,6 @@ static bool _ddgs_cpu_preprocess_one(const DDGSCPUsettings& settings, const DDGS
 	return true;
 }
 
-/* composites every gaussian binned into one tile, in front to back order
- * (transcribed from _ddgs_forward_splat_kernel)
- */
 static void _ddgs_cpu_rasterize_tile(const DDGSCPUsettings& settings, const std::vector<DCsplat>& splats,
                                      const uint64_t* tileEntries, int64_t numToRender, uint32_t tileX, uint32_t tileY,
                                      float* outColor, float* outAlpha, float* outDepth)
@@ -237,8 +225,6 @@ static void _ddgs_cpu_rasterize_tile(const DDGSCPUsettings& settings, const std:
 	uint32_t pixelMaxX = std::min(pixelMinX + DDGS_CPU_TILE_SIZE, settings.width );
 	uint32_t pixelMaxY = std::min(pixelMinY + DDGS_CPU_TILE_SIZE, settings.height);
 
-	//pixels outside the image are considered done from the start, matching the
-	//threads a partial tile wastes on the GPU
 	uint32_t numInside = (pixelMaxX - pixelMinX) * (pixelMaxY - pixelMinY);
 	uint32_t numDone = 0;
 
@@ -412,12 +398,6 @@ uint64_t ddgs_cpu_forward(const DDGSCPUsettings& settings, const DDGSCPUgaussian
 
 	//bin gaussians into their tiles:
 	//---------------
-	/* an entry packs the raw bits of the view space depth above the gaussian
-	 * index. sorting those ascending puts the nearest gaussian first (negative
-	 * floats compare in reverse as unsigned, and everything in front of the
-	 * camera has negative z) and breaks ties by gaussian index, which is the
-	 * order the GPU's stable radix sort produces
-	 */
 	std::vector<uint64_t> entries(numRendered);
 
 	for(uint64_t tile = 0; tile < numTiles; tile++)

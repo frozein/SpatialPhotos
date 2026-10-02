@@ -1,16 +1,6 @@
 /* ddgs_cpu.h
  *
  * multithreaded CPU rasterizer for 3D gaussian splats, forward pass only
- *
- * the math is a transcription of the DDGS CUDA renderer (see DDGS/csrc):
- * same covariance projection, same alpha clamps, same front-to-back
- * compositing and the same "depth of the 0.95 transmittance crossing"
- * depth output. the parallel structure is not a transcription - tiles are
- * handed out to worker threads instead of thread blocks, and the per-tile
- * gaussian lists are built and sorted per tile rather than with a global
- * radix sort.
- *
- * nothing needed only by a backward pass is computed or retained.
  */
 
 #ifndef DDGS_CPU_H

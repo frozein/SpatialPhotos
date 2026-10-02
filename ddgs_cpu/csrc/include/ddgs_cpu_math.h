@@ -1,13 +1,6 @@
 /* ddgs_cpu_math.h
  *
  * minimal vector / matrix math for the CPU renderer
- *
- * the conventions here are copied from QuickMath (which the CUDA renderer
- * uses), so that the transcribed splatting math stays identical:
- *   - matrices are column-major, indexed m[column][row]
- *   - dc_matN_mult(a, b) is the standard matrix product a * b
- *   - dc_quat_to_mat3() returns the transpose of the textbook rotation
- *     matrix, exactly like qm_quaternion_to_mat4() does
  */
 
 #ifndef DDGS_CPU_MATH_H
