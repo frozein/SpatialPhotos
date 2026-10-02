@@ -8,29 +8,16 @@ from PIL import Image
 
 # ------------------------------------------- #
 
-IMAGE_FORMAT = "WEBP"
-
-# encoder settings per format. lossless webp is ~30% smaller than png on these
-# atlases, method 4 costs a few seconds and is within 1% of method 6.
-# exact keeps the rgb under fully transparent texels instead of letting libwebp
-# pick whatever compresses best - the atlas is premultiplied, so those texels are
-# already black and preserving them is (marginally) smaller as well as exact
 IMAGE_OPTIONS = {
 	"WEBP": dict(lossless=True, quality=75, method=4, exact=True),
 	"PNG":  dict(optimize=True),
 }
-
 MIME_TYPES = {
 	"WEBP": "image/webp",
 	"PNG":  "image/png",
 	"JPEG": "image/jpeg",
 }
-
-# gltf core only allows png and jpeg, webp textures need this extension. it is
-# declared as required, so a viewer without it fails loudly instead of showing
-# an untextured mesh
 WEBP_EXTENSION = "EXT_texture_webp"
-UV_PADDING = 1
 
 VertexFields: TypeAlias = tuple[Any, Any, Any, Any, Any, Any]
 NumpyVertexFields: TypeAlias = tuple[
@@ -45,17 +32,19 @@ RenderBuffers: TypeAlias = tuple[np.ndarray, np.ndarray, np.ndarray]
 
 # ------------------------------------------- #
 
-def _to_numpy(array: Any, dtype: Any | None = None) -> np.ndarray:
+def to_numpy(array: Any, dtype: Any | None = None) -> np.ndarray:
 	if hasattr(array, "detach"):
 		array = array.detach().cpu().numpy()
+
 	return np.ascontiguousarray(array, dtype=dtype)
 
-def _get_vertex_fields(vertices: VertexFields) -> NumpyVertexFields:
+def get_vertex_fields(vertices: VertexFields) -> NumpyVertexFields:
 	dtypes = (np.uint16, np.float32, np.uint16, np.uint16, np.uint16, np.uint16)
-	fields = tuple(_to_numpy(field, dtype) for field, dtype in zip(vertices, dtypes))
+	fields = tuple(to_numpy(field, dtype) for field, dtype in zip(vertices, dtypes))
+
 	return fields
 
-def _get_padded_atlas_coordinates(
+def get_padded_atlas_coordinates(
 	sliceIdx: np.ndarray,
 	sourceX: np.ndarray,
 	sourceY: np.ndarray,
@@ -72,8 +61,6 @@ def _get_padded_atlas_coordinates(
 	if uvPadding == 0:
 		return atlasCoordinates.reshape(-1, 2)
 
-	# A neighboring block is seamless only when it is adjacent in both the source
-	# image and the atlas. Every other edge is inset to avoid texture bleeding.
 	blockKeys = np.column_stack([
 		sliceIdx.reshape(-1, 4)[:, 0],
 		sourceX.reshape(-1, 4)[:, 3],
@@ -110,10 +97,15 @@ def build_render_buffers(
 	imageHeight: int,
 	focal: float,
 	blockSize: int,
-	uvPadding: int = UV_PADDING,
+	uvPadding: int,
 ) -> RenderBuffers:
-	sliceIdx, depth, sourceX, sourceY, atlasX, atlasY = _get_vertex_fields(vertices)
 
+	# unpack vertex fields:
+	# ---------------
+	sliceIdx, depth, sourceX, sourceY, atlasX, atlasY = get_vertex_fields(vertices)
+
+	# convert src pixel coordinates -> NDC:
+	# ---------------
 	positions = np.empty((len(depth), 3), dtype=np.float32)
 	positions[:, 0] = sourceX
 	positions[:, 0] -= imageWidth * 0.5
@@ -125,8 +117,10 @@ def build_render_buffers(
 	positions[:, 1] /= focal
 	positions[:, 2] = depth
 
+	# pad atlas coords:
+	# ---------------
 	atlasHeight, atlasWidth = atlas.shape[:2]
-	uvs = _get_padded_atlas_coordinates(
+	uvs = get_padded_atlas_coordinates(
 		sliceIdx,
 		sourceX,
 		sourceY,
@@ -138,6 +132,8 @@ def build_render_buffers(
 	uvs[:, 0] /= atlasWidth
 	uvs[:, 1] /= atlasHeight
 
+	# create index buf:
+	# ---------------
 	quadBase = np.arange(len(depth) // 4, dtype=np.uint32) * 4
 	indices = np.stack([
 		quadBase,
@@ -150,6 +146,8 @@ def build_render_buffers(
 
 	return positions, uvs, indices
 
+# ------------------------------------------- #
+
 def export_glb(
 	atlas: Any,
 	vertices: VertexFields,
@@ -158,8 +156,12 @@ def export_glb(
 	focal: float,
 	blockSize: int,
 	outPath: str | PathLike[str],
-	uvPadding: int = UV_PADDING,
+	uvPadding: int = 1,
+	imageFormat: str = "WEBP"
 ) -> None:
+
+	# validate:
+	# ---------------
 	if min(imageWidth, imageHeight, blockSize) <= 0:
 		raise ValueError("image dimensions and blockSize must be positive")
 	if not np.isfinite(focal) or focal <= 0:
@@ -167,7 +169,9 @@ def export_glb(
 	if uvPadding < 0 or uvPadding * 2 >= blockSize:
 		raise ValueError("uvPadding must be nonnegative and less than half the block size")
 
-	atlas = _to_numpy(atlas, np.uint8)
+	# build render buffers:
+	# ---------------
+	atlas = to_numpy(atlas, np.uint8)
 	positions, uvs, indices = build_render_buffers(
 		atlas,
 		vertices,
@@ -183,14 +187,11 @@ def export_glb(
 	imgBytes = io.BytesIO()
 
 	atlasImg = Image.fromarray(atlas)
-	atlasImg.save(imgBytes, format=IMAGE_FORMAT, **IMAGE_OPTIONS.get(IMAGE_FORMAT, {}))
+	atlasImg.save(imgBytes, format=imageFormat, **IMAGE_OPTIONS.get(imageFormat, {}))
 	imgBytes = imgBytes.getvalue()
 
 	# define GLTF structure:
 	# ---------------
-	# the image lives in the binary chunk rather than a base64 data uri, which
-	# would cost 33% on top of whatever the encoder achieved. bufferViews start
-	# on 4 byte boundaries
 	imgOffset = positions.nbytes + uvs.nbytes + indices.nbytes
 	imgPadding = -imgOffset % 4
 
@@ -202,7 +203,7 @@ def export_glb(
 		imgBytes
 	)
 
-	isWebp = IMAGE_FORMAT == "WEBP"
+	isWebp = imageFormat == "WEBP"
 
 	model = gltf.GLTF2(
 		asset=gltf.Asset(version="2.0"),
@@ -220,7 +221,7 @@ def export_glb(
 			gltf.Accessor(bufferView=1, componentType=gltf.FLOAT, count=len(uvs), type="VEC2"),
 			gltf.Accessor(bufferView=2, componentType=gltf.UNSIGNED_INT, count=len(indices.flat), type="SCALAR")
 		],
-		images=[gltf.Image(bufferView=3, mimeType=MIME_TYPES[IMAGE_FORMAT])],
+		images=[gltf.Image(bufferView=3, mimeType=MIME_TYPES[imageFormat])],
 		textures=[
 			gltf.Texture(extensions={WEBP_EXTENSION: {"source": 0}}) if isWebp else gltf.Texture(source=0)
 		],
