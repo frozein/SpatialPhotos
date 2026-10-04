@@ -16,3 +16,8 @@
 test_out/
 
 *.DS_Store
+
+# renderer package
+viewer/node_modules/
+viewer/dist/
+viewer/*.tgz
