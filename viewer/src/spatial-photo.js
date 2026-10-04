@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { parseSPM, buildRenderBuffers } from './spm.js';
 
 // ------------------------------------------- //
@@ -63,13 +62,21 @@ export class SpatialPhotoElement extends ElementBase
 		this.source = null;
 		this.loadId = 0;
 		this.loadController = null;
+
 		this.renderer = null;
 		this.scene = null;
 		this.camera = null;
-		this.controls = null;
+
+		this.targetPosition = new THREE.Vector3();
+		this.pointerX = 0;
+		this.pointerY = 0;
+		this.hovered = false;
+		this.lastFrame = 0;
+
 		this.mesh = null;
 		this.header = null;
 		this.photoInfo = null;
+
 		this.isLoading = false;
 		this.loadError = null;
 
@@ -92,9 +99,7 @@ export class SpatialPhotoElement extends ElementBase
 					width: 100%;
 					height: 100%;
 					display: block;
-					cursor: grab;
 				}
-				canvas:active { cursor: grabbing; }
 				.status {
 					position: absolute;
 					left: 16px;
@@ -122,6 +127,16 @@ export class SpatialPhotoElement extends ElementBase
 		`;
 		this.statusElement = this.shadowRoot.querySelector('.status');
 		this.progressElement = this.shadowRoot.querySelector('progress');
+
+		//follow the pointer, return to centre when the mouse leaves:
+		//---------------
+		this.addEventListener('pointerenter', event => this.aim(event));
+		this.addEventListener('pointermove', event => this.aim(event));
+		this.addEventListener('pointerdown', event => this.aim(event));
+		this.addEventListener('pointerleave', event => {
+			if(event.pointerType !== 'touch')
+				this.hovered = false;
+		});
 	}
 
 	connectedCallback() 
@@ -155,8 +170,6 @@ export class SpatialPhotoElement extends ElementBase
 
 		this.clearPhoto();
 
-		this.controls?.dispose();
-
 		if(this.renderer) 
 		{
 			this.renderer.setAnimationLoop(null);
@@ -165,7 +178,10 @@ export class SpatialPhotoElement extends ElementBase
 			this.renderer.domElement.remove();
 		}
 
-		this.renderer = this.scene = this.camera = this.controls = null;
+		this.renderer = this.scene = this.camera = null;
+		this.targetPosition.set(0, 0, 0);
+		this.pointerX = this.pointerY = 0;
+		this.hovered = false;
 		this.setState(false);
 	}
 
@@ -196,6 +212,11 @@ export class SpatialPhotoElement extends ElementBase
 	get error() { return this.loadError; }
 	get info() { return this.photoInfo; }
 
+	get sensitivity() { return Number(this.getAttribute('sensitivity') ?? 0.075); }
+	set sensitivity(value) { this.setAttribute('sensitivity', String(value)); }
+	get snappiness() { return Number(this.getAttribute('snappiness') ?? 0.1); }
+	set snappiness(value) { this.setAttribute('snappiness', String(value)); }
+
 	// ------------------------------------------- //
 
 	init() 
@@ -219,10 +240,6 @@ export class SpatialPhotoElement extends ElementBase
 		this.scene = new THREE.Scene();
 
 		this.camera = new THREE.PerspectiveCamera(45, 1, 0.001, 1000);
-		this.camera.position.set(0, 0, 1);
-
-		this.controls = new OrbitControls(this.camera, canvas);
-		this.controls.enableDamping = true;
 
 		//watch for resize:
 		//---------------
@@ -230,10 +247,44 @@ export class SpatialPhotoElement extends ElementBase
 		this.resizeObserver.observe(this);
 		this.resize();
 
-		this.renderer.setAnimationLoop(() => {
-			this.controls.update();
+		this.lastFrame = performance.now();
+		this.renderer.setAnimationLoop(time => {
+			const dt = Math.min(time - this.lastFrame, 100);
+			this.lastFrame = time;
+			this.updateCamera(dt);
 			this.renderer.render(this.scene, this.camera);
 		});
+	}
+
+	aim(event)
+	{
+		const rect = this.getBoundingClientRect();
+		if(!rect.width || !rect.height)
+			return;
+
+		this.pointerX = THREE.MathUtils.clamp((event.clientX - rect.left) / rect.width * 2 - 1, -1, 1);
+		this.pointerY = THREE.MathUtils.clamp(1 - (event.clientY - rect.top) / rect.height * 2, -1, 1);
+		this.hovered = true;
+	}
+
+	updateCamera(dt)
+	{
+		//set target position:
+		//---------------
+		const sensitivity = this.sensitivity;
+		this.targetPosition.set(
+			this.hovered ? this.pointerX * sensitivity : 0,
+			this.hovered ? this.pointerY * sensitivity : 0,
+			0,
+		);
+
+		//apply easing:
+		//---------------
+		const snappiness = THREE.MathUtils.clamp(this.snappiness, 0, 1);
+		const amount = 1 - Math.pow(1 - snappiness, dt / (1000 / 60));
+		this.camera.position.lerp(this.targetPosition, amount);
+		this.camera.position.z = 0;
+		this.camera.rotation.set(0, 0, 0);
 	}
 
 	resize() 
@@ -268,15 +319,14 @@ export class SpatialPhotoElement extends ElementBase
 			return;
 
 		const bounds = this.mesh.geometry.boundingBox;
-		const depth = (bounds.min.z + bounds.max.z) * 0.5;
 
 		this.camera.near = Math.max(0.0001, bounds.min.z * 0.001);
 		this.camera.far = Math.max(100, bounds.max.z * 100);
 		this.camera.position.set(0, 0, 0);
-		this.controls.target.set(0, 0, -depth);
-		this.controls.minDistance = Math.max(0.001, bounds.min.z * 0.02);
-		this.controls.maxDistance = Math.max(10, bounds.max.z * 20);
-		this.controls.update();
+		this.camera.rotation.set(0, 0, 0);
+		this.targetPosition.set(0, 0, 0);
+		this.pointerX = this.pointerY = 0;
+		this.hovered = false;
 		
 		this.resize();
 	}

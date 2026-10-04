@@ -26,6 +26,8 @@ export interface SpatialPhotoEventMap
 export declare class SpatialPhotoElement extends HTMLElement 
 {
 	src: string;
+	sensitivity: number;
+	snappiness: number;
 	readonly loading: boolean;
 	readonly error: Error | null;
 	readonly info: SpatialPhotoInfo | null;
