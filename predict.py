@@ -15,7 +15,7 @@ from spatial_photos import ATLAS_MAX_SIZE, spatial_photo
 
 # ------------------------------------------- #
 
-CHECKPOINT_PATH = Path("/Users/daniel/Downloads/sharp.pt")
+DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ------------------------------------------- #
@@ -37,7 +37,7 @@ def predict(
 	opaqueOnly: bool = False,
 	outputFormat: str = "SPM",
 	uvPadding: int = 1,
-	checkpointPath: Path = CHECKPOINT_PATH,
+	checkpointPath: Path = None,
 	quality: int = 75,
 ) -> None:
 
@@ -87,8 +87,12 @@ def predict(
 
 	# create ml-sharp predictor:
 	# ---------------
-	log_info(f"Loading checkpoint from {checkpointPath}")
-	stateDict = torch.load(checkpointPath, weights_only=True)
+	if checkpointPath is None:
+		print(f"No checkpoint provided. Downloading default model from {DEFAULT_MODEL_URL}")
+		stateDict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
+	else:
+		print(f"Loading checkpoint from {checkpointPath}")
+		stateDict = torch.load(checkpointPath, weights_only=True)
 
 	gaussianPredictor = create_predictor(PredictorParams())
 	gaussianPredictor.load_state_dict(stateDict)
@@ -160,7 +164,7 @@ if __name__ == "__main__":
 	parser.add_argument("--outfill", type=float, default=0)
 	parser.add_argument("--uv-padding", type=int, default=1)
 	parser.add_argument("--opaque-only", action="store_true")
-	parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
+	parser.add_argument("--checkpoint", type=Path, default=None)
 	parser.add_argument("--quality", type=int, default=75, help="SPM JPEG quality 0–100 for color and grayscale alpha (default: 75). Both are lossy.")
 	args = parser.parse_args()
 	
