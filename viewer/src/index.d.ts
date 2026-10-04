@@ -34,8 +34,6 @@ export declare class SpatialPhotoElement extends HTMLElement
 
 	load(source: SpatialPhotoSource | null): Promise<SpatialPhotoInfo | null>;
 	
-	resetView(): void;
-	
 	addEventListener<K extends keyof SpatialPhotoEventMap>(type: K, listener: (this: SpatialPhotoElement, event: SpatialPhotoEventMap[K]) => void, options?: boolean | AddEventListenerOptions): void;
 	addEventListener<K extends keyof HTMLElementEventMap>(type: K, listener: (this: HTMLElement, event: HTMLElementEventMap[K]) => void, options?: boolean | AddEventListenerOptions): void;
 	addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;

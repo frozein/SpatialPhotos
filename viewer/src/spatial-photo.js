@@ -313,24 +313,6 @@ export class SpatialPhotoElement extends ElementBase
 			this.renderer.render(this.scene, this.camera);
 	}
 
-	resetView() 
-	{
-		if(!this.mesh) 
-			return;
-
-		const bounds = this.mesh.geometry.boundingBox;
-
-		this.camera.near = Math.max(0.0001, bounds.min.z * 0.001);
-		this.camera.far = Math.max(100, bounds.max.z * 100);
-		this.camera.position.set(0, 0, 0);
-		this.camera.rotation.set(0, 0, 0);
-		this.targetPosition.set(0, 0, 0);
-		this.pointerX = this.pointerY = 0;
-		this.hovered = false;
-		
-		this.resize();
-	}
-
 	// ------------------------------------------- //
 
 	async readPhoto(source, signal, onProgress)
@@ -514,7 +496,19 @@ export class SpatialPhotoElement extends ElementBase
 				blocks: photo.header.totalBlocks,
 				bytes: data.byteLength,
 			};
-			this.resetView();
+
+			//start at the capture pose:
+			//---------------
+			const bounds = this.mesh.geometry.boundingBox;
+			this.camera.near = Math.max(0.0001, bounds.min.z * 0.001);
+			this.camera.far = Math.max(100, bounds.max.z * 100);
+			this.camera.position.set(0, 0, 0);
+			this.camera.rotation.set(0, 0, 0);
+			this.targetPosition.set(0, 0, 0);
+			this.pointerX = this.pointerY = 0;
+			this.hovered = false;
+			this.resize();
+
 			this.setState(false);
 			this.emit('load', this.photoInfo);
 
