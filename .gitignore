@@ -3,7 +3,6 @@
 *.mkv
 *.png
 *.ply
-*.glb
 *.bmp
 
 # model weights

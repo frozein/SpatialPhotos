@@ -35,7 +35,6 @@ def predict(
 	blockSize: int = 64,
 	outfillAmount: float = 0.0,
 	opaqueOnly: bool = False,
-	outputFormat: str = "SPM",
 	uvPadding: int = 1,
 	checkpointPath: Path = None,
 	quality: int = 75,
@@ -43,8 +42,6 @@ def predict(
 
 	# validate:
 	# ---------------
-	outputFormat = outputFormat.upper()
-
 	if not inputPath.exists():
 		raise FileNotFoundError(f"Input path does not exist: {inputPath}")
 	if not 0 < numSlices <= 65536:
@@ -53,11 +50,7 @@ def predict(
 		raise ValueError(f"blockSize must be between 1 and {ATLAS_MAX_SIZE}")
 	if not math.isfinite(outfillAmount) or outfillAmount < 0:
 		raise ValueError("outfillAmount must be nonnegative and finite")
-	if outputFormat not in ("SPM", "GLB"):
-		raise ValueError("outputFormat must be SPM or GLB")
-	if inputPath.is_file() and outputPath.suffix.lower() in (".glb", ".spm"):
-		outputFormat = outputPath.suffix[1:].upper()
-	if outputFormat == "SPM" and blockSize % 8:
+	if blockSize % 8:
 		raise ValueError("SPM blockSize must be a multiple of 8 for JPEG block alignment")
 	if not math.isfinite(uvPadding) or uvPadding < 0 or uvPadding * 2 >= blockSize:
 		raise ValueError("uvPadding must be nonnegative and less than half the block size")
@@ -72,7 +65,7 @@ def predict(
 		if inputPath.suffix in io.get_supported_image_extensions():
 			imagePaths = [inputPath]
 	else:
-		if outputPath.is_file() or outputPath.suffix.lower() in (".glb", ".spm"):
+		if outputPath.is_file() or outputPath.suffix.lower() == ".spm":
 			log_error(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
 			return
 
@@ -101,7 +94,7 @@ def predict(
 
 	# process each image:
 	# ---------------
-	singleOutputFile = inputIsFile and outputPath.suffix.lower() in (".glb", ".spm")
+	singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".spm"
 	outputDirectory = outputPath.parent if singleOutputFile else outputPath
 	outputDirectory.mkdir(exist_ok=True, parents=True)
 
@@ -135,14 +128,13 @@ def predict(
 			numSlices=numSlices,
 			blockSize=blockSize,
 			opaqueOnly=opaqueOnly,
-			atlasBlockLimit=256 if outputFormat == "SPM" else None,
+			atlasBlockLimit=256,
 		)
 
-		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.{outputFormat.lower()}"
+		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spm"
 		log_info(f"Saving Spatial Photo to {outFile}")
 
-		exportFunction = exporter.export_spm if outputFormat == "SPM" else exporter.export_glb
-		exportFunction(
+		exporter.export_spm(
 			atlas=atlas,
 			vertices=vertices,
 			imageWidth=outputWidth,
@@ -151,14 +143,15 @@ def predict(
 			blockSize=blockSize,
 			outPath=outFile,
 			uvPadding=uvPadding,
-			**({"numSlices": numSlices, "opaqueOnly": opaqueOnly, "quality": quality} if outputFormat == "SPM" else {}),
+			numSlices=numSlices,
+			opaqueOnly=opaqueOnly,
+			quality=quality,
 		)
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description="Convert ML-SHARP predictions into sparse SPM meshes or GLBs.")
+	parser = argparse.ArgumentParser(description="Convert ML-SHARP predictions into sparse SPM meshes.")
 	parser.add_argument("input", type=Path, help="Input image or image directory")
-	parser.add_argument("output", type=Path, help="Output .spm/.glb file or directory")
-	parser.add_argument("--format", choices=("spm", "glb"), default="spm", help="Directory output format (default: spm)")
+	parser.add_argument("output", type=Path, help="Output .spm file or directory")
 	parser.add_argument("--slices", type=int, default=30)
 	parser.add_argument("--block-size", type=int, default=64)
 	parser.add_argument("--outfill", type=float, default=0)
@@ -170,7 +163,7 @@ if __name__ == "__main__":
 	
 	predict(
 		args.input, args.output, numSlices=args.slices, blockSize=args.block_size,
-		outfillAmount=args.outfill, opaqueOnly=args.opaque_only, outputFormat=args.format,
+		outfillAmount=args.outfill, opaqueOnly=args.opaque_only,
 		uvPadding=args.uv_padding, checkpointPath=args.checkpoint,
 		quality=args.quality,
 	)
