@@ -19,8 +19,8 @@ NumpyVertexFields: TypeAlias = tuple[
 	np.ndarray,
 ]
 
-SPM_MAGIC = b"SPM\x04"
-SPM_HEADER = struct.Struct("<4s4If3If5I")
+SPATIAL_MAGIC = b"SPA\x00"
+SPATIAL_HEADER = struct.Struct("<4s4If3If5I")
 
 # ------------------------------------------- #
 
@@ -58,7 +58,7 @@ def encode_alpha(alpha: np.ndarray, quality: int = 75) -> bytes:
 		optimize=True, progressive=False)
 	return buffer.getvalue()
 
-def export_spm(
+def export_spatial(
 	atlas: Any,
 	vertices: VertexFields,
 	imageWidth: int,
@@ -123,8 +123,8 @@ def export_spm(
 	alphaBytes = encode_alpha(alpha, quality)
 
 	flags = int(bool(opaqueOnly))
-	header = SPM_HEADER.pack(
-		SPM_MAGIC, imageWidth, imageHeight, numSlices, blockSize,
+	header = SPATIAL_HEADER.pack(
+		SPATIAL_MAGIC, imageWidth, imageHeight, numSlices, blockSize,
 		focal, atlasWidth, atlasHeight, flags, uvPadding,
 		len(uniqueKeys), len(blockKeys), len(geometry), len(colorBytes), len(alphaBytes),
 	)

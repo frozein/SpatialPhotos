@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { parseSPM, buildRenderBuffers } from './spm.js';
+import { parseSpatial, buildRenderBuffers } from './format.js';
 
 // ------------------------------------------- //
 
@@ -372,9 +372,9 @@ export class SpatialPhotoElement extends ElementBase
 
 	async createPhoto(data, signal)
 	{
-		//read SPM:
+		//read Spatial:
 		//---------------
-		const photo = parseSPM(data);
+		const photo = parseSpatial(data);
 		if(!photo.header.totalBlocks)
 			throw new Error('This photo has no visible blocks.');
 

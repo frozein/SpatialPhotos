@@ -1,5 +1,5 @@
 const HEADER_BYTES = 60;
-const SPM_MAGIC = 0x044d5053;
+const SPATIAL_MAGIC = 0x00415053;
 
 // ------------------------------------------- //
 
@@ -24,12 +24,12 @@ function readMask(view, offset, numSlots, count)
 	return { indices, offset: offset + maskBytes };
 }
 
-export function parseSPM(data) 
+export function parseSpatial(data) 
 {
 	const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	if(view.getUint32(0, true) !== SPM_MAGIC)
-		throw new Error('This photo is not in the SPM format.');
+	if(view.getUint32(0, true) !== SPATIAL_MAGIC)
+		throw new Error('This photo is not in the Spatial format.');
 
 	//read header:
 	//---------------

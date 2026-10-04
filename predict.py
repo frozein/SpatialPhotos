@@ -51,7 +51,7 @@ def predict(
 	if not math.isfinite(outfillAmount) or outfillAmount < 0:
 		raise ValueError("outfillAmount must be nonnegative and finite")
 	if blockSize % 8:
-		raise ValueError("SPM blockSize must be a multiple of 8 for JPEG block alignment")
+		raise ValueError("Spatial blockSize must be a multiple of 8 for JPEG block alignment")
 	if not math.isfinite(uvPadding) or uvPadding < 0 or uvPadding * 2 >= blockSize:
 		raise ValueError("uvPadding must be nonnegative and less than half the block size")
 	if not 0 <= quality <= 100:
@@ -65,7 +65,7 @@ def predict(
 		if inputPath.suffix in io.get_supported_image_extensions():
 			imagePaths = [inputPath]
 	else:
-		if outputPath.is_file() or outputPath.suffix.lower() == ".spm":
+		if outputPath.is_file() or outputPath.suffix.lower() == ".spatial":
 			log_error(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
 			return
 
@@ -94,7 +94,7 @@ def predict(
 
 	# process each image:
 	# ---------------
-	singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".spm"
+	singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".spatial"
 	outputDirectory = outputPath.parent if singleOutputFile else outputPath
 	outputDirectory.mkdir(exist_ok=True, parents=True)
 
@@ -131,10 +131,10 @@ def predict(
 			atlasBlockLimit=256,
 		)
 
-		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spm"
+		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spatial"
 		log_info(f"Saving Spatial Photo to {outFile}")
 
-		exporter.export_spm(
+		exporter.export_spatial(
 			atlas=atlas,
 			vertices=vertices,
 			imageWidth=outputWidth,
@@ -149,16 +149,16 @@ def predict(
 		)
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description="Convert ML-SHARP predictions into sparse SPM meshes.")
+	parser = argparse.ArgumentParser(description="Convert ML-SHARP predictions into sparse Spatial meshes.")
 	parser.add_argument("input", type=Path, help="Input image or image directory")
-	parser.add_argument("output", type=Path, help="Output .spm file or directory")
+	parser.add_argument("output", type=Path, help="Output .spatial file or directory")
 	parser.add_argument("--slices", type=int, default=30)
 	parser.add_argument("--block-size", type=int, default=64)
 	parser.add_argument("--outfill", type=float, default=0)
 	parser.add_argument("--uv-padding", type=int, default=1)
 	parser.add_argument("--opaque-only", action="store_true")
 	parser.add_argument("--checkpoint", type=Path, default=None)
-	parser.add_argument("--quality", type=int, default=75, help="SPM JPEG quality 0–100 for color and grayscale alpha (default: 75). Both are lossy.")
+	parser.add_argument("--quality", type=int, default=75, help="Spatial JPEG quality 0–100 for color and grayscale alpha (default: 75). Both are lossy.")
 	args = parser.parse_args()
 	
 	predict(
