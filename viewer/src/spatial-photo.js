@@ -214,7 +214,7 @@ export class SpatialPhotoElement extends ElementBase
 
 	get sensitivity() { return Number(this.getAttribute('sensitivity') ?? 0.075); }
 	set sensitivity(value) { this.setAttribute('sensitivity', String(value)); }
-	get snappiness() { return Number(this.getAttribute('snappiness') ?? 0.1); }
+	get snappiness() { return Number(this.getAttribute('snappiness') ?? 5.5); }
 	set snappiness(value) { this.setAttribute('snappiness', String(value)); }
 
 	// ------------------------------------------- //
@@ -278,10 +278,11 @@ export class SpatialPhotoElement extends ElementBase
 			0,
 		);
 
-		//apply easing:
+		//map logarithmic snappiness to catch-up per 60 fps frame:
 		//---------------
-		const snappiness = THREE.MathUtils.clamp(this.snappiness, 0, 1);
-		const amount = 1 - Math.pow(1 - snappiness, dt / (1000 / 60));
+		const snappiness = THREE.MathUtils.clamp(this.snappiness, 1, 10);
+		const catchUp = Math.pow(10, (snappiness - 10) * 2 / 9);
+		const amount = 1 - Math.pow(1 - catchUp, dt / (1000 / 60));
 		this.camera.position.lerp(this.targetPosition, amount);
 		this.camera.position.z = 0;
 		this.camera.rotation.set(0, 0, 0);

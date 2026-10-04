@@ -69,8 +69,8 @@
 				<input id="sensitivity" type="range" min="0" max="0.3" step="0.005" value="0.075">
 			</label>
 			<label for="snappiness">
-				Snappiness <output id="snappiness-value">0.10</output>
-				<input id="snappiness" type="range" min="0" max="1" step="0.01" value="0.1">
+				Snappiness <output id="snappiness-value">5.5</output>
+				<input id="snappiness" type="range" min="1" max="10" step="0.1" value="5.5">
 			</label>
 			<p>Move the pointer to look around, or tap and drag on touch screens. Drop an SPM file anywhere to open it.</p>
 			<output id="status" aria-live="polite" hidden></output>
@@ -125,7 +125,7 @@
 		});
 		document.querySelector('#snappiness').addEventListener('input', event => {
 			photo.snappiness = Number(event.target.value);
-			document.querySelector('#snappiness-value').textContent = photo.snappiness.toFixed(2);
+			document.querySelector('#snappiness-value').textContent = photo.snappiness.toFixed(1);
 		});
 
 		//accept file drops across the whole page:
