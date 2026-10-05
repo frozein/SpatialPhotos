@@ -2,6 +2,8 @@
 
 Add a 3D effect to any image, and ship it anywhere with a web-ready format! This project uses Apple's ML-SHARP model to genarate a 3D Gaussian splat from a single image, then converts it into a compact `.spatial` format, ready to be shipped on the web and viewed anywhere.
 
+![A GIF comparing an original photo with it's spatial photo representation](showcase/comparison.gif)
+
 ## Quickstart
 
 Use Python 3.11+ and a C++17 compiler. To build it, navigate to the repository root and run:
