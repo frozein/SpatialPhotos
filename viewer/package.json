@@ -1,6 +1,6 @@
 {
 	"name": "spatial-photos",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "A web component for viewing .spatial photos.",
 	"type": "module",
 	"license": "MIT",
@@ -12,7 +12,7 @@
 			"import": "./dist/index.js"
 		}
 	},
-	"files": ["dist", "README.md", "THIRD_PARTY_LICENSES.txt"],
+	"files": ["dist", "README.md", "LICENSE.md", "THIRD_PARTY_LICENSES.txt"],
 	"sideEffects": ["./dist/index.js"],
 	"scripts": {
 		"build": "node build.js",

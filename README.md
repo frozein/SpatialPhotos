@@ -1,29 +1,35 @@
 # Spatial Photos
 
-Add a 3D effect to any image, and ship it anywhere with a web-ready format! This project uses Apple's ML-SHARP model to genarate a 3D Gaussian splat from a single image, then converts it into a compact `.spatial` format, ready to be shipped on the web and viewed anywhere.
+Add a 3D effect to any image, and ship it anywhere with a web-ready format! This project uses Apple's ML-SHARP model to generate a 3D Gaussian splat from a single image, then converts it into a compact `.spatial` format, ready to be shipped on the web and viewed anywhere.
 
-![A GIF comparing an original photo with it's spatial photo representation](showcase/comparison.gif)
+![A GIF comparing an original photo with its spatial photo representation](showcase/comparison.gif)
 
 ## Quickstart
 
-Use Python 3.11+ and a C++17 compiler. To build it, navigate to the repository root and run:
+Use Python 3.11+ and a C++20 compiler. Clone the
+repository with its submodule, then build from the repository root:
 
 ```sh
-git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/frozein/SpatialPhotos.git
+cd SpatialPhotos
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ./ml-sharp rectpack ninja
-.venv/bin/python -m ddgs_cpu
+source .venv/bin/activate
+python -m pip install -e ./ml-sharp rectpack ninja
+python -m ddgs_cpu
 ```
+
+On Windows, use `python` instead of `python3` and activate with
+`.venv\Scripts\activate.bat` from a Visual Studio Developer Command Prompt.
 
 Then, to generate a spatial photo, run:
 ```sh
-.venv/bin/python predict.py input.jpg output.spatial
+python predict.py input.jpg output.spatial
 ```
 
-The ML-SHARP model checkpoint downloads automatically on first use. Pass
+The ML-SHARP model checkpoint (about 2.8 GB) downloads automatically on first use. Pass
 `--checkpoint /path/to/sharp.pt` to use a local checkpoint.
 
-To view the output locally, run:
+To view the output locally, use Node.js 22.12+ (or Node.js 20.19+) and run:
 
 ```sh
 cd viewer

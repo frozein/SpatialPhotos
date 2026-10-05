@@ -2,7 +2,8 @@
 
 Build with `python -m ddgs_cpu`. The C++ extension is cached by PyTorch 
 and also builds automatically on first render if needed. Building 
-needs a C++17 compiler (Xcode command line tools on macOS) and `ninja`.
+needs a compatible C++ compiler (C++20 for current PyTorch), `ninja`,
+and an activated Python environment.
 """
 
 import math
@@ -54,8 +55,8 @@ def _load_extension(*, verbose=None):
 		name=_MODULE_NAME,
 		sources=sources,
 		extra_include_paths=[os.path.join(_CSRC_DIR, "include")],
-		extra_cflags=(["/O2", "/std:c++17"] if os.name == "nt" else
-					  ["-O3", "-std=c++17", "-fno-math-errno", "-funroll-loops"]),
+		extra_cflags=(["/O2"] if os.name == "nt" else
+					  ["-O3", "-fno-math-errno", "-funroll-loops"]),
 		with_cuda=False,
 		verbose=os.environ.get("DDGS_CPU_VERBOSE", "0") == "1" if verbose is None else verbose,
 	)

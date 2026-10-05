@@ -18,4 +18,5 @@ await build({
 });
 
 await copyFile('src/index.d.ts', 'dist/index.d.ts');
+await copyFile('../LICENSE.md', 'LICENSE.md');
 await copyFile('node_modules/three/LICENSE', 'THIRD_PARTY_LICENSES.txt');

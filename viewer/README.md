@@ -9,7 +9,7 @@ Three.js and TypeScript declarations are included.
 npm install spatial-photos
 ```
 
-Import the component in your app:
+Import the component in an app using a bundler such as Vite:
 
 ```js
 import 'spatial-photos';
@@ -59,6 +59,8 @@ Style the host with CSS. The `canvas`, `status`, and `progress` CSS parts and
 
 ## Development
 
+Use Node.js 22.12 or newer (Node.js 20.19+ also works).
+
 ```sh
 cd viewer
 npm install
@@ -74,4 +76,4 @@ npm pack
 ```
 
 Build output is in `dist/`. Packing builds the module automatically and includes
-the README, types, and third-party license; examples are excluded.
+the README, types, and licenses; examples are excluded.
