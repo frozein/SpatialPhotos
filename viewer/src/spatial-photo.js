@@ -51,7 +51,7 @@ const ElementBase = globalThis.HTMLElement || class {};
 
 export class SpatialPhotoElement extends ElementBase 
 {
-	static observedAttributes = ['src'];
+	static observedAttributes = ['src', 'fit'];
 
 	constructor() 
 	{
@@ -190,6 +190,12 @@ export class SpatialPhotoElement extends ElementBase
 		if(oldValue === value) 
 			return;
 		
+		if(name === 'fit')
+		{
+			this.resize();
+			return;
+		}
+
 		this.source = value;
 		if(this.isConnected) 
 			this.load(value).catch(() => {});
@@ -216,6 +222,8 @@ export class SpatialPhotoElement extends ElementBase
 	set sensitivity(value) { this.setAttribute('sensitivity', String(value)); }
 	get snappiness() { return Number(this.getAttribute('snappiness') ?? 5.5); }
 	set snappiness(value) { this.setAttribute('snappiness', String(value)); }
+	get fit() { return this.getAttribute('fit') === 'cover' ? 'cover' : 'contain'; }
+	set fit(value) { this.setAttribute('fit', String(value)); }
 
 	// ------------------------------------------- //
 
@@ -299,13 +307,34 @@ export class SpatialPhotoElement extends ElementBase
 		this.renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio || 1, 2));
 		this.renderer.setSize(width, height, false);
 		
-		this.camera.aspect = width / height;
+		//letterbox the original image when containing:
+		//---------------
+		let viewWidth = width;
+		let viewHeight = height;
+		const contain = this.header && this.fit === 'contain';
+		if(contain)
+		{
+			const sourceAspect = this.header.originalWidth / this.header.originalHeight;
+			if(width / height > sourceAspect)
+				viewWidth = height * sourceAspect;
+			else
+				viewHeight = width / sourceAspect;
+		}
+		const viewX = (width - viewWidth) / 2;
+		const viewY = (height - viewHeight) / 2;
+		this.renderer.setScissorTest(false);
+		this.renderer.clear();
+		this.renderer.setViewport(viewX, viewY, viewWidth, viewHeight);
+		this.renderer.setScissor(viewX, viewY, viewWidth, viewHeight);
+		this.renderer.setScissorTest(Boolean(contain));
+
+		this.camera.aspect = viewWidth / viewHeight;
 		
 		if(this.header) 
 		{
-			const sourceAspect = this.header.imageWidth / this.header.imageHeight;
+			const sourceAspect = this.header.originalWidth / this.header.originalHeight;
 			this.camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(
-				this.header.imageHeight / (2 * this.header.focal) * Math.max(1, sourceAspect / this.camera.aspect)
+				this.header.originalHeight / (2 * this.header.focal) * Math.min(1, sourceAspect / this.camera.aspect)
 			));
 		}
 		this.camera.updateProjectionMatrix();
@@ -491,8 +520,8 @@ export class SpatialPhotoElement extends ElementBase
 			this.header = photo.header;
 			this.scene.add(photo.mesh);
 			this.photoInfo = {
-				width: photo.header.imageWidth,
-				height: photo.header.imageHeight,
+				width: photo.header.originalWidth,
+				height: photo.header.originalHeight,
 				slices: photo.header.numSlices,
 				blocks: photo.header.totalBlocks,
 				bytes: data.byteLength,

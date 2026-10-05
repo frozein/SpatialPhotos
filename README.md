@@ -51,7 +51,7 @@ Directory inputs require a directory output.
 | `--quality N` | JPEG encoding quality for both color and alpha, `0`–`100`. Default: `75`. |
 | `--slices N` | Number of depth layers. More layers leads to larger files, but can help reduce artifacts. Default: `20`. |
 | `--block-size N` | Block size in pixels, must be a multiple of 8. Smaller blocks generally lead to smaller files and higher quality, but slower processing and rendering. Default: `32`. |
-| `--outfill N` | Extend output bounds by this fraction. Default: `0`. |
+| `--outfill N` | Extend output bounds by this fraction to fill borders when panning. Default: `0`. |
 | `--uv-padding N` | Inset exposed atlas edges in pixels, helps reduce artifacts during rendering. Default: `1`. |
 | `--opaque-only` | Use opaque rendering, leads smaller files, but at lower quality. |
 | `--checkpoint PATH` | Local ML-SHARP model checkpoint, otherwise downloaded and cached automatically. |
@@ -68,8 +68,8 @@ The image data within each block gets packed into a **texture atlas**. The atlas
 
 A `.spatial` file stores this information in three parts:
 
-1. **Header:** 60 bytes beginning with `SPA\x00`, containing image and atlas
-   dimensions, slice count, block size, camera focal length, and payload lengths.
+1. **Header:** 68 bytes beginning with `SPA\x00`, containing expanded image,
+   original image, and atlas dimensions, slice count, block size, camera focal length, and payload lengths.
 2. **Geometry:** each slice stores bitmasks marking which grid corners and
    blocks exist. Present corners have 32-bit floating-point depths; present
    blocks have a pair of one-byte atlas coordinates, measured in blocks.

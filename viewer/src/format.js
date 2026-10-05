@@ -1,4 +1,4 @@
-const HEADER_BYTES = 60;
+const HEADER_BYTES = 68;
 const SPATIAL_MAGIC = 0x00415053;
 
 // ------------------------------------------- //
@@ -48,6 +48,8 @@ export function parseSpatial(data)
 		geometryBytes: view.getUint32(48, true),
 		colorBytes: view.getUint32(52, true),
 		alphaBytes: view.getUint32(56, true),
+		originalWidth: view.getUint32(60, true),
+		originalHeight: view.getUint32(64, true),
 	};
 	header.gridWidth = header.imageWidth / header.blockSize;
 	header.gridHeight = header.imageHeight / header.blockSize;

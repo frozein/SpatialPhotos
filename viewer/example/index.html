@@ -39,6 +39,7 @@
 		:focus-visible { outline: 2px solid #bbbbbb; outline-offset: 2px; }
 		label { display: grid; grid-template-columns: 1fr auto; gap: 8px; font-size: 13px; }
 		input[type="range"] { grid-column: 1 / -1; width: 100%; margin: 0; accent-color: #bbbbbb; }
+		input[type="checkbox"] { margin: 0; accent-color: #bbbbbb; }
 		label output { color: #aaaaaa; font-variant-numeric: tabular-nums; }
 		p, #status { margin: 0; color: #aaaaaa; font-size: 12px; line-height: 1.5; }
 		#status { overflow-wrap: anywhere; }
@@ -64,6 +65,9 @@
 		<div class="panel">
 			<button id="open" type="button">Open Spatial</button>
 			<input id="file" type="file" accept=".spatial" hidden>
+			<label for="cover">
+				Cover framing <input id="cover" type="checkbox">
+			</label>
 			<label for="sensitivity">
 				Sensitivity <output id="sensitivity-value">0.075</output>
 				<input id="sensitivity" type="range" min="0" max="0.3" step="0.005" value="0.075">
@@ -117,8 +121,11 @@
 			fileInput.value = '';
 		});
 
-		//adjust camera feel:
+		//adjust framing + camera feel:
 		//---------------
+		document.querySelector('#cover').addEventListener('change', event => {
+			photo.fit = event.target.checked ? 'cover' : 'contain';
+		});
 		document.querySelector('#sensitivity').addEventListener('input', event => {
 			photo.sensitivity = Number(event.target.value);
 			document.querySelector('#sensitivity-value').textContent = photo.sensitivity.toFixed(3);

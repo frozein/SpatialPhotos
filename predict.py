@@ -132,6 +132,8 @@ def predict(
 			vertices=vertices,
 			imageWidth=outputWidth,
 			imageHeight=outputHeight,
+			originalWidth=width,
+			originalHeight=height,
 			focal=focalY,
 			blockSize=blockSize,
 			outPath=outFile,

@@ -20,7 +20,7 @@ NumpyVertexFields: TypeAlias = tuple[
 ]
 
 SPATIAL_MAGIC = b"SPA\x00"
-SPATIAL_HEADER = struct.Struct("<4s4If3If5I")
+SPATIAL_HEADER = struct.Struct("<4s4If3If7I")
 
 # ------------------------------------------- #
 
@@ -63,6 +63,8 @@ def export_spatial(
 	vertices: VertexFields,
 	imageWidth: int,
 	imageHeight: int,
+	originalWidth: int,
+	originalHeight: int,
 	focal: float,
 	blockSize: int,
 	outPath: str | PathLike[str],
@@ -127,6 +129,7 @@ def export_spatial(
 		SPATIAL_MAGIC, imageWidth, imageHeight, numSlices, blockSize,
 		focal, atlasWidth, atlasHeight, flags, uvPadding,
 		len(uniqueKeys), len(blockKeys), len(geometry), len(colorBytes), len(alphaBytes),
+		originalWidth, originalHeight,
 	)
 
 	Path(outPath).write_bytes(header + geometry + colorBytes + alphaBytes)

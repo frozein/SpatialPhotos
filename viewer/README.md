@@ -26,17 +26,20 @@ import 'spatial-photos';
 
 On desktop, move the mouse to pan around; leaving the photo returns the camera to center. On mobile, tap or drag to pan around.
 Set the size with CSS. Without an explicit height, the component uses a 4:3 aspect ratio.
+By default, the whole original photo is visible with letterboxing. Set
+`fit="cover"` to fill the component by cropping. Outfill is reserved for panning.
 
 ## Documentation
 
 | Attribute / property | Description |
 | --- | --- |
 | `src` | Photo URL. Changing it loads a new photo, removing it clears the view. |
+| `fit` | `contain` shows the whole photo with letterboxing; `cover` fills the component by cropping. Default: `contain`. |
 | `sensitivity` | Maximum X/Y offset in world units. Default: `0.075`. |
 | `snappiness` | Logarithmic catch-up speed from `1` to `10`. `10` is instant. Default: `5.5`. |
 | `loading` | Read-only loading state. |
 | `error` | Read-only last `Error`, or `null`. |
-| `info` | Read-only `{ width, height, slices, blocks, bytes }`, or `null`. |
+| `info` | Read-only `{ width, height, slices, blocks, bytes }`, or `null`. Width and height are the original image dimensions. |
 
 `load(source)` accepts a URL, `File`, `Blob`, `ArrayBuffer`, or `Uint8Array`.
 It resolves to photo info, rejects on errors, and returns `null` when canceled
