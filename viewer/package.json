@@ -1,6 +1,6 @@
 {
 	"name": "spatial-photos",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"description": "A web component for viewing .spatial photos.",
 	"type": "module",
 	"license": "MIT",
