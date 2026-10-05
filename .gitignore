@@ -1,22 +1,24 @@
-# testing data
-*.mp4
-*.mkv
+# local testing data
 *.png
-*.ply
+*.jpg
+*.jpeg
+*.webp
 *.bmp
+*.tiff
+*.ply
 
 # model weights
 *.pth
 
 # pycache
 **/__pycache__/
+
 # python venv
 .venv/
-test_out/
-
-*.DS_Store
 
 # renderer package
 viewer/node_modules/
 viewer/dist/
-viewer/*.tgz
+
+# macos
+*.DS_Store

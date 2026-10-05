@@ -149,16 +149,16 @@ def predict(
 		)
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description="Convert ML-SHARP predictions into sparse Spatial meshes.")
+	parser = argparse.ArgumentParser(description="Generate a 3D representation of a photo, in a .spatial format.")
 	parser.add_argument("input", type=Path, help="Input image or image directory")
 	parser.add_argument("output", type=Path, help="Output .spatial file or directory")
-	parser.add_argument("--slices", type=int, default=30)
-	parser.add_argument("--block-size", type=int, default=64)
-	parser.add_argument("--outfill", type=float, default=0)
-	parser.add_argument("--uv-padding", type=int, default=1)
-	parser.add_argument("--opaque-only", action="store_true")
-	parser.add_argument("--checkpoint", type=Path, default=None)
-	parser.add_argument("--quality", type=int, default=75, help="Spatial JPEG quality 0–100 for color and grayscale alpha (default: 75). Both are lossy.")
+	parser.add_argument("--quality", type=int, default=75, help="JPEG encoding quality for both color and alpha, 0-100.")
+	parser.add_argument("--slices", type=int, default=20, help="Number of depth layers. More layers leads to larger files, but can help reduce artifacts.")
+	parser.add_argument("--block-size", type=int, default=32, help="Block size in pixels, must be a multiple of 8. Smaller blocks generally lead to smaller files and higher quality, but slower processing and rendering.")
+	parser.add_argument("--outfill", type=float, default=0, help="Extend output bounds by this fraction.")
+	parser.add_argument("--uv-padding", type=int, default=1, help="Inset exposed atlas edges in pixels, helps reduce artifacts during rendering.")
+	parser.add_argument("--opaque-only", action="store_true", help="Use opaque rendering, leads smaller files, but at lower quality.")
+	parser.add_argument("--checkpoint", type=Path, default=None, help="Local ML-SHARP model checkpoint, otherwise downloaded and cached automatically.")
 	args = parser.parse_args()
 	
 	predict(
