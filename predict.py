@@ -20,14 +20,6 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ------------------------------------------- #
 
-def log_error(msg: str) -> None:
-	print(msg)
-
-def log_info(msg: str) -> None:
-	print(msg)
-
-# ------------------------------------------- #
-
 def predict(
 	inputPath: Path,
 	outputPath: Path,
@@ -66,17 +58,17 @@ def predict(
 			imagePaths = [inputPath]
 	else:
 		if outputPath.is_file() or outputPath.suffix.lower() == ".spatial":
-			log_error(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
+			print(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
 			return
 
 		for ext in io.get_supported_image_extensions():
 			imagePaths.extend(list(inputPath.glob(f"**/*{ext}")))
 
 	if len(imagePaths) == 0:
-		log_error(f"No valid images found. Input was {inputPath}.")
+		print(f"No valid images found. Input was {inputPath}.")
 		return
 
-	log_info(f"Processing {len(imagePaths)} valid image files.")
+	print(f"- Processing {len(imagePaths)} valid image files -")
 
 	# create ml-sharp predictor:
 	# ---------------
@@ -99,7 +91,8 @@ def predict(
 	outputDirectory.mkdir(exist_ok=True, parents=True)
 
 	for imagePath in imagePaths:
-		log_info(f"Predicting gaussians for {imagePath}")
+		print()
+		print(f"Predicting gaussians for {imagePath}...")
 
 		image, _, focalY = io.load_rgb(imagePath)
 		height, width = image.shape[:2]
@@ -117,7 +110,7 @@ def predict(
 		if gaussians.mean_vectors.numel() == 0:
 			raise ValueError(f"Prediction produced no gaussians for {imagePath}")
 
-		log_info(f"Generating Spatial Photo for {imagePath}")
+		print(f"Generating Spatial Photo for {imagePath}...")
 
 		atlas, vertices = spatial_photo(
 			image=image, 
@@ -132,7 +125,7 @@ def predict(
 		)
 
 		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spatial"
-		log_info(f"Saving Spatial Photo to {outFile}")
+		print(f"Saving Spatial Photo to {outFile}...")
 
 		exporter.export_spatial(
 			atlas=atlas,
