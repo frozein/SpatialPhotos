@@ -12,8 +12,15 @@
 			"import": "./dist/index.js"
 		}
 	},
-	"files": ["dist", "README.md", "LICENSE.md", "THIRD_PARTY_LICENSES.txt"],
-	"sideEffects": ["./dist/index.js"],
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE.md",
+		"THIRD_PARTY_LICENSES.txt"
+	],
+	"sideEffects": [
+		"./dist/index.js"
+	],
 	"scripts": {
 		"build": "node build.js",
 		"dev": "vite --host 127.0.0.1",
@@ -30,5 +37,12 @@
 		"three": "0.160.0",
 		"vite": "^7.0.0"
 	},
-	"keywords": ["spatial-photo", "web-component", "react", "three", "spatial", "3d"]
+	"keywords": [
+		"spatial-photo",
+		"web-component",
+		"react",
+		"three",
+		"spatial",
+		"3d"
+	]
 }
