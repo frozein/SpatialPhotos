@@ -39,7 +39,7 @@ function makeTexture(image, colorSpace)
 	texture.premultiplyAlpha = false;
 	texture.colorSpace = colorSpace;
 	texture.generateMipmaps = false;
-	texture.minFilter = texture.magFilter = THREE.NearestFilter;
+	texture.minFilter = texture.magFilter = THREE.LinearFilter;
 	texture.needsUpdate = true;
 
 	return texture;
