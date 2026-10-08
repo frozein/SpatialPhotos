@@ -53,6 +53,7 @@ Directory inputs require a directory output.
 | --- | --- |
 | `--quality N` | JPEG encoding quality for both color and alpha, `0`–`100`. Default: `75`. |
 | `--block-size N` | Block size in pixels, must be a multiple of 8. Smaller blocks generally lead to smaller files and higher quality, but slower processing and rendering. Default: `32`. |
+| `--depth-scale FLOAT` | Intensity of the 3D depth effect. Larger values increase the depth range. Default: `0.5`. |
 | `--opaque-only` | Use opaque rendering, leads smaller files, but at lower quality. |
 
 ## File Format // What is a Spatial Photo?
