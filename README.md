@@ -1,34 +1,37 @@
-# Spatial Photos
+# Spatial Photos (Depth Anything V2 Fork)
 
-Add a 3D effect to any image, and ship it anywhere with a web-ready format! This project uses Apple's ML-SHARP model to generate a 3D Gaussian splat from a single image, then converts it into a compact `.spatial` format, ready to be shipped on the web and viewed anywhere.
+> **Note:** This is a fork of the original [SpatialPhotos](https://github.com/frozein/SpatialPhotos) repository. The primary objective of this fork was to replace the proprietary Apple `ml-sharp` model and its 3D Gaussian Splatting logic (`ddgs_cpu`) with a local, open-source model optimized for macOS Apple Silicon (**Depth Anything V2** running on PyTorch with MPS). This approach significantly streamlines the dependencies and enables the direct generation of single-slice `.spatial` meshes from monocular depth maps.
+
+Add a 3D effect to any image, and ship it anywhere with a web-ready format! This project uses **Depth Anything V2** to generate a depth map from a single image, then converts it into a compact `.spatial` format, ready to be shipped on the web and viewed anywhere.
 
 ![A GIF comparing an original photo with its spatial photo representation](showcase/comparison.gif)
 
 ## Quickstart
 
-Use Python 3.11+ and a C++20 compiler. Clone the
-repository with its submodule, then build from the repository root:
+Use Python 3.11+. Clone the repository and initialize the virtual environment:
 
 ```sh
-git clone --recurse-submodules https://github.com/frozein/SpatialPhotos.git
+git clone https://github.com/frozein/SpatialPhotos.git
 cd SpatialPhotos
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ./ml-sharp rectpack ninja
-python -m ddgs_cpu
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-On Windows, use `python` instead of `python3` and activate with
-`.venv\Scripts\activate.bat` from a Visual Studio Developer Command Prompt.
-
-Then, to generate a spatial photo, run:
+To generate a spatial photo, run:
 ```sh
 python predict.py input.jpg output.spatial
 ```
 
-The ML-SHARP model checkpoint (about 2.8 GB) downloads automatically on first use. Pass
-`--checkpoint /path/to/sharp.pt` to use a local checkpoint.
+The Depth Anything V2 model checkpoint (`depth-anything/Depth-Anything-V2-Small-hf`) downloads automatically on first use.
 
+### Batch Processing
+To process an entire folder of `.webp` images, you can use the provided Zsh script (modify the script variables as needed):
+```sh
+./batch_process.sh
+```
+
+### Viewer
 To view the output locally, use Node.js 22.12+ (or Node.js 20.19+) and run:
 
 ```sh
@@ -49,20 +52,13 @@ Directory inputs require a directory output.
 | Option | Description |
 | --- | --- |
 | `--quality N` | JPEG encoding quality for both color and alpha, `0`–`100`. Default: `75`. |
-| `--slices N` | Number of depth layers. More layers leads to larger files, but can help reduce artifacts. Default: `20`. |
 | `--block-size N` | Block size in pixels, must be a multiple of 8. Smaller blocks generally lead to smaller files and higher quality, but slower processing and rendering. Default: `32`. |
-| `--outfill N` | Extend output bounds by this fraction to fill borders when panning. Default: `0`. |
-| `--uv-padding N` | Inset exposed atlas edges in pixels, helps reduce artifacts during rendering. Default: `1`. |
 | `--opaque-only` | Use opaque rendering, leads smaller files, but at lower quality. |
-| `--checkpoint PATH` | Local ML-SHARP model checkpoint, otherwise downloaded and cached automatically. |
 
 ## File Format // What is a Spatial Photo?
 
 A spatial photo is a still image that can be viewed from slightly different
-positions, giving the impression that a full 3D scene was captured. This limited 3D representation is estimated by ML-SHARP, from nothing but the original image.
-
-The scene is divided into depth layers, called **slices**. The foreground, midground, background, etc all get placed on distinct slices. Each slice is split into a regular grid of
-small image blocks. Empty blocks are omitted. Each block corner has a depth, which determines its 3D position.
+positions, giving the impression that a full 3D scene was captured. 
 
 The image data within each block gets packed into a **texture atlas**. The atlas is a single image containing every single block. There are 2 atlases: one for the RGB color, and one for alpha. 
 
@@ -70,10 +66,7 @@ A `.spatial` file stores this information in three parts:
 
 1. **Header:** 68 bytes beginning with `SPA\x00`, containing expanded image,
    original image, and atlas dimensions, slice count, block size, camera focal length, and payload lengths.
-2. **Geometry:** each slice stores bitmasks marking which grid corners and
-   blocks exist. Present corners have 32-bit floating-point depths; present
-   blocks have a pair of one-byte atlas coordinates, measured in blocks.
-   Each shared corner depth is stored once per slice.
+2. **Geometry:** bitmasks marking which grid corners and blocks exist. Present corners have 32-bit floating-point depths; present blocks have a pair of one-byte atlas coordinates, measured in blocks.
 3. **Images:** the color JPEG followed by the grayscale alpha JPEG. Both are
    compressed using the same `--quality` setting and are lossy.
 
@@ -85,9 +78,7 @@ See [exporter.py](exporter.py) for the binary layout and encoding.
 
 | Path | Purpose |
 | --- | --- |
-| [predict.py](predict.py) | CLI, model inference, and input settings. |
-| [spatial_photos.py](spatial_photos.py) | Slice rendering, atlas packing, and mesh generation. |
+| [predict.py](predict.py) | CLI, Depth Anything V2 inference, and spatial generation. |
+| [batch_process.sh](batch_process.sh) | Zsh script for processing folders of images. |
 | [exporter.py](exporter.py) | Spatial serialization and JPEG encoding. |
-| [ddgs_cpu/](ddgs_cpu/) | C++ CPU Gaussian renderer. |
-| [ml-sharp/](ml-sharp/) | ML-SHARP model submodule. |
 | [viewer/](viewer/README.md) | Web component and standalone demo. |
