@@ -1,3 +1,0 @@
--I./csrc/include
--std=c++20
--xc++

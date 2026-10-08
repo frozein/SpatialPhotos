@@ -22,3 +22,9 @@ viewer/dist/
 
 # macos
 *.DS_Store
+
+# local-only files
+batch_process.sh
+test_spatial.py
+test_output.spatial
+*.spatial

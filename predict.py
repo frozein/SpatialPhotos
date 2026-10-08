@@ -1,164 +1,182 @@
-import math
 import argparse
-import torch
+import math
 from pathlib import Path
-
-from sharp.utils import io
-from sharp.models import (
-    PredictorParams,
-    create_predictor,
-)
-from sharp.cli.predict import predict_image
+import numpy as np
+import cv2
+import torch
+from PIL import Image
+from transformers import pipeline
 
 import exporter
-from spatial_photos import ATLAS_MAX_SIZE, spatial_photo
+
+# ------------------------------------------- #
+# Hardware configuration
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 
 # ------------------------------------------- #
 
-DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def get_supported_extensions():
+    return {".webp", ".png", ".jpg", ".jpeg"}
 
-# ------------------------------------------- #
+def generate_spatial_from_depth(image_path, depth_map_np, out_path, block_size=32, focal_y=1000.0, quality=75, opaque_only=True, depth_scale=0.5):
+    img = Image.open(image_path).convert("RGBA")
+    img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    width, height = img.size
+    
+    # Pad to block_size
+    pad_w = (block_size - (width % block_size)) % block_size
+    pad_h = (block_size - (height % block_size)) % block_size
+    
+    padded_w = width + pad_w
+    padded_h = height + pad_h
+    
+    atlas = np.zeros((padded_h, padded_w, 4), dtype=np.uint8)
+    atlas[:height, :width] = np.array(img)
+    atlas[:height, :width, 3] = 255 # solid alpha for main image
+    
+    grid_w = padded_w // block_size
+    grid_h = padded_h // block_size
+    
+    # Depth map normalization / conversion to metric-like scale
+    depth_map_np = np.fliplr(depth_map_np)
+    d_min, d_max = depth_map_np.min(), depth_map_np.max()
+    if d_max > d_min:
+        normalized_depth = (depth_map_np - d_min) / (d_max - d_min)
+    else:
+        normalized_depth = np.zeros_like(depth_map_np)
+        
+    # Inverse depth means higher = closer. 
+    # Apple spatial format expects Z where higher is further away.
+    inverted_depth = 1.0 - normalized_depth
+    
+    # Map to [zMin, zMax]. Scale the intensity using depth_scale.
+    z_min = 1.0
+    z_max = 1.0 + (4.0 * depth_scale)
+    metric_depth = z_min + inverted_depth * (z_max - z_min)
+    
+    # Resize depth to grid size + 1
+    depth_grid = cv2.resize(metric_depth, (grid_w + 1, grid_h + 1))
+    
+    # Generate blocks
+    blocks = []
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            blocks.append((0, gx * block_size, gy * block_size, gx * block_size, gy * block_size))
+            
+    N = len(blocks)
+    sliceIdx = np.zeros(N * 4, dtype=np.uint16)
+    
+    cornerGridX = np.zeros((N, 4), dtype=int)
+    cornerGridY = np.zeros((N, 4), dtype=int)
+    
+    for i, (s_idx, sx, sy, ax, ay) in enumerate(blocks):
+        gx = sx // block_size
+        gy = sy // block_size
+        cornerGridX[i] = [gx, gx + 1, gx + 1, gx]
+        cornerGridY[i] = [gy + 1, gy + 1, gy, gy]
+        
+    depths = np.zeros(N * 4, dtype=np.float32)
+    for i in range(N):
+        for c in range(4):
+            depths[i*4 + c] = depth_grid[cornerGridY[i, c], cornerGridX[i, c]]
+            
+    sourceX = (cornerGridX * block_size).flatten().astype(np.uint16)
+    sourceY = (cornerGridY * block_size).flatten().astype(np.uint16)
+    atlasX = sourceX.copy()
+    atlasY = sourceY.copy()
+    
+    vertices = (sliceIdx, depths, sourceX, sourceY, atlasX, atlasY)
+    
+    exporter.export_spatial(
+        atlas=atlas,
+        vertices=vertices,
+        imageWidth=padded_w,
+        imageHeight=padded_h,
+        originalWidth=width,
+        originalHeight=height,
+        focal=focal_y,
+        blockSize=block_size,
+        outPath=out_path,
+        opaqueOnly=opaque_only,
+        quality=quality
+    )
 
 def predict(
-	inputPath: Path,
-	outputPath: Path,
-	numSlices: int = 30,
-	blockSize: int = 64,
-	outfillAmount: float = 0.0,
-	opaqueOnly: bool = False,
-	uvPadding: int = 1,
-	checkpointPath: Path = None,
-	quality: int = 75,
+    inputPath: Path,
+    outputPath: Path,
+    blockSize: int = 32,
+    quality: int = 75,
+    opaqueOnly: bool = True,
+    depthScale: float = 0.5,
 ) -> None:
 
-	# validate:
-	# ---------------
-	if not inputPath.exists():
-		raise FileNotFoundError(f"Input path does not exist: {inputPath}")
-	if not 0 < numSlices <= 65536:
-		raise ValueError("numSlices must be between 1 and 65536")
-	if not 0 < blockSize <= ATLAS_MAX_SIZE:
-		raise ValueError(f"blockSize must be between 1 and {ATLAS_MAX_SIZE}")
-	if not math.isfinite(outfillAmount) or outfillAmount < 0:
-		raise ValueError("outfillAmount must be nonnegative and finite")
-	if blockSize % 8:
-		raise ValueError("Spatial blockSize must be a multiple of 8 for JPEG block alignment")
-	if not math.isfinite(uvPadding) or uvPadding < 0 or uvPadding * 2 >= blockSize:
-		raise ValueError("uvPadding must be nonnegative and less than half the block size")
-	if not 0 <= quality <= 100:
-		raise ValueError("quality must be between 0 and 100")
+    if not inputPath.exists():
+        raise FileNotFoundError(f"Input path does not exist: {inputPath}")
 
-	# get list of input images:
-	# ---------------
-	inputIsFile = inputPath.is_file()
-	imagePaths: list[Path] = []
-	if inputIsFile:
-		if inputPath.suffix in io.get_supported_image_extensions():
-			imagePaths = [inputPath]
-	else:
-		if outputPath.is_file() or outputPath.suffix.lower() == ".spatial":
-			print(f"Output path must be a directory when the input is a directory. Input was {inputPath} and output was {outputPath}")
-			return
+    inputIsFile = inputPath.is_file()
+    imagePaths = []
+    if inputIsFile:
+        if inputPath.suffix.lower() in get_supported_extensions():
+            imagePaths = [inputPath]
+    else:
+        if outputPath.is_file() or outputPath.suffix.lower() == ".spatial":
+            print(f"Output path must be a directory when input is a directory.")
+            return
+        for ext in get_supported_extensions():
+            imagePaths.extend(list(inputPath.glob(f"**/*{ext}")))
 
-		for ext in io.get_supported_image_extensions():
-			imagePaths.extend(list(inputPath.glob(f"**/*{ext}")))
+    if not imagePaths:
+        print(f"No valid images found in {inputPath}")
+        return
 
-	if len(imagePaths) == 0:
-		print(f"No valid images found. Input was {inputPath}.")
-		return
+    print(f"- Processing {len(imagePaths)} valid image files -")
+    print(f"Loading {MODEL_ID} on {DEVICE}...")
+    
+    pipe = pipeline("depth-estimation", model=MODEL_ID, device=DEVICE)
 
-	print(f"- Processing {len(imagePaths)} valid image files -")
+    singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".spatial"
+    outputDirectory = outputPath.parent if singleOutputFile else outputPath
+    outputDirectory.mkdir(exist_ok=True, parents=True)
 
-	# create ml-sharp predictor:
-	# ---------------
-	if checkpointPath is None:
-		print(f"No checkpoint provided. Downloading default model from {DEFAULT_MODEL_URL}")
-		stateDict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True)
-	else:
-		print(f"Loading checkpoint from {checkpointPath}")
-		stateDict = torch.load(checkpointPath, weights_only=True)
-
-	gaussianPredictor = create_predictor(PredictorParams())
-	gaussianPredictor.load_state_dict(stateDict)
-	gaussianPredictor.eval()
-	gaussianPredictor.to(DEVICE)
-
-	# process each image:
-	# ---------------
-	singleOutputFile = inputIsFile and outputPath.suffix.lower() == ".spatial"
-	outputDirectory = outputPath.parent if singleOutputFile else outputPath
-	outputDirectory.mkdir(exist_ok=True, parents=True)
-
-	for imagePath in imagePaths:
-		print()
-		print(f"Predicting gaussians for {imagePath}...")
-
-		image, _, focalY = io.load_rgb(imagePath)
-		height, width = image.shape[:2]
-		if not math.isfinite(focalY) or focalY <= 0:
-			raise ValueError(f"Focal length must be positive and finite for {imagePath}")
-
-		outputWidth = math.floor((1 + outfillAmount) * width)
-		outputHeight = math.floor((1 + outfillAmount) * height)
-		outputWidth = ((outputWidth + blockSize - 1) // blockSize) * blockSize
-		outputHeight = ((outputHeight + blockSize - 1) // blockSize) * blockSize
-		if max(outputWidth, outputHeight) > 65535:
-			raise ValueError("Output image coordinates must fit in uint16")
-
-		gaussians = predict_image(gaussianPredictor, image, focalY, DEVICE)
-		if gaussians.mean_vectors.numel() == 0:
-			raise ValueError(f"Prediction produced no gaussians for {imagePath}")
-
-		print(f"Generating Spatial Photo for {imagePath}...")
-
-		atlas, vertices = spatial_photo(
-			image=image, 
-			gaussians=gaussians, 
-			focalY=focalY,
-			outputWidth=outputWidth,
-			outputHeight=outputHeight,
-			numSlices=numSlices,
-			blockSize=blockSize,
-			opaqueOnly=opaqueOnly,
-			atlasBlockLimit=256,
-		)
-
-		outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spatial"
-		print(f"Saving Spatial Photo to {outFile}...")
-
-		exporter.export_spatial(
-			atlas=atlas,
-			vertices=vertices,
-			imageWidth=outputWidth,
-			imageHeight=outputHeight,
-			originalWidth=width,
-			originalHeight=height,
-			focal=focalY,
-			blockSize=blockSize,
-			outPath=outFile,
-			uvPadding=uvPadding,
-			numSlices=numSlices,
-			opaqueOnly=opaqueOnly,
-			quality=quality,
-		)
+    for imagePath in imagePaths:
+        print(f"\nProcessing {imagePath}...")
+        img = Image.open(imagePath).convert("RGB")
+        
+        # Depth Anythng V2 Inference
+        print("Predicting depth map...")
+        result = pipe(img)
+        depth_np = np.array(result["depth"]).astype(np.float32)
+        
+        outFile = outputPath if singleOutputFile else outputPath / f"{imagePath.stem}.spatial"
+        print(f"Generating Spatial Photo -> {outFile}")
+        
+        generate_spatial_from_depth(
+            image_path=imagePath,
+            depth_map_np=depth_np,
+            out_path=outFile,
+            block_size=blockSize,
+            focal_y=max(img.height, img.width),
+            quality=quality,
+            opaque_only=opaqueOnly,
+            depth_scale=depthScale,
+        )
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description="Generate a 3D representation of a photo, in a .spatial format.")
-	parser.add_argument("input", type=Path, help="Input image or image directory")
-	parser.add_argument("output", type=Path, help="Output .spatial file or directory")
-	parser.add_argument("--quality", type=int, default=75, help="JPEG encoding quality for both color and alpha, 0-100.")
-	parser.add_argument("--slices", type=int, default=20, help="Number of depth layers. More layers leads to larger files, but can help reduce artifacts.")
-	parser.add_argument("--block-size", type=int, default=32, help="Block size in pixels, must be a multiple of 8. Smaller blocks generally lead to smaller files and higher quality, but slower processing and rendering.")
-	parser.add_argument("--outfill", type=float, default=0, help="Extend output bounds by this fraction.")
-	parser.add_argument("--uv-padding", type=int, default=1, help="Inset exposed atlas edges in pixels, helps reduce artifacts during rendering.")
-	parser.add_argument("--opaque-only", action="store_true", help="Use opaque rendering, leads smaller files, but at lower quality.")
-	parser.add_argument("--checkpoint", type=Path, default=None, help="Local ML-SHARP model checkpoint, otherwise downloaded and cached automatically.")
-	args = parser.parse_args()
-	
-	predict(
-		args.input, args.output, numSlices=args.slices, blockSize=args.block_size,
-		outfillAmount=args.outfill, opaqueOnly=args.opaque_only,
-		uvPadding=args.uv_padding, checkpointPath=args.checkpoint,
-		quality=args.quality,
-	)
+    parser = argparse.ArgumentParser(description="Generate a 3D representation of a photo using Depth Anything V2.")
+    parser.add_argument("input", type=Path, help="Input image or image directory")
+    parser.add_argument("output", type=Path, help="Output .spatial file or directory")
+    parser.add_argument("--quality", type=int, default=75, help="JPEG encoding quality")
+    parser.add_argument("--block-size", type=int, default=32, help="Block size in pixels, multiple of 8.")
+    parser.add_argument("--opaque-only", action="store_true", default=True, help="Use opaque rendering (smaller files).")
+    parser.add_argument("--depth-scale", type=float, default=0.5, help="Intensity of the 3D depth effect (default 0.5)")
+    
+    args = parser.parse_args()
+    
+    predict(
+        args.input, args.output,
+        blockSize=args.block_size,
+        quality=args.quality,
+        opaqueOnly=args.opaque_only,
+        depthScale=args.depth_scale,
+    )
