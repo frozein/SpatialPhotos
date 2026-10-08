@@ -91,3 +91,9 @@ See [exporter.py](exporter.py) for the binary layout and encoding.
 | [ddgs_cpu/](ddgs_cpu/) | C++ CPU Gaussian renderer. |
 | [ml-sharp/](ml-sharp/) | ML-SHARP model submodule. |
 | [viewer/](viewer/README.md) | Web component and standalone demo. |
+
+## Note on Licensing
+
+This project is free, open source, and intended for experimentation and research. It uses Apple's ML-SHARP model, whose pretrained weights are subject to a separate [research-only license](https://github.com/apple-aiml-research/ml-sharp/blob/main/LICENSE_MODEL) that prohibits commercial use and product development.
+
+The model weights are not distributed with this project and are downloaded separately on first use. The MIT license applies only to this project's original code, not to ML-SHARP or its weights.
